@@ -1542,14 +1542,52 @@ async def add_channel_and_refresh(text: str, private: bool = False) -> str:
     return "Канал сохранён, но пока недоступен. Проверьте ссылку/ID и доступ аккаунта Telethon."
 
 
+def keyword_add_prompt(prefix: str = "") -> str:
+    header = (prefix.strip() + "\n\n") if prefix.strip() else ""
+    return (
+        header
+        + "Отправьте новое ключевое слово или фразу.\n"
+        + "Если передумали, нажмите «Назад»."
+    )
+
+
+def channel_add_prompt(private: bool, prefix: str = "") -> str:
+    header = (prefix.strip() + "\n\n") if prefix.strip() else ""
+    if private:
+        return (
+            header
+            + "Закрытый канал.\n\n"
+            + "Пришлите invite-ссылку вида https://t.me/+hash, метку можно написать через пробел.\n"
+            + "Пример: https://t.me/+hash Закрытый канал\n"
+            + "Если аккаунт уже состоит в канале, можно указать ID вида -1001234567890.\n"
+            + "Если передумали, нажмите «Назад»."
+        )
+    return (
+        header
+        + "Открытый канал.\n\n"
+        + "Пришлите @username или ссылку. Метку можно написать через пробел.\n"
+        + "Пример: @rian_ru РИА Новости\n"
+        + "Пример: https://t.me/rian_ru РИА Новости\n"
+        + "Если аккаунт Telethon не подписан, бот попробует подписаться сам.\n"
+        + "Если передумали, нажмите «Назад»."
+    )
+
+
 async def handle_admin_text(chat_id: int, text: str, message_id: Optional[int] = None) -> None:
     text = text.strip()
     mode = ADMIN_MODES.pop(chat_id, "")
     await delete_message_quiet(chat_id, message_id)
 
     if mode == "add":
-        result = "Добавил." if add_keyword(text) else "Такой ключ уже есть или текст пустой."
-        await show_admin_screen(chat_id, result + "\n\n" + format_keyword_list(), keyword_list_keyboard())
+        if add_keyword(text):
+            await show_admin_screen(chat_id, "Добавил.\n\n" + format_keyword_list(), keyword_list_keyboard())
+        else:
+            ADMIN_MODES[chat_id] = "add"
+            await show_admin_screen(
+                chat_id,
+                keyword_add_prompt("Такой ключ уже есть или текст пустой. Отправьте другой вариант."),
+                back_keyboard("kw:list"),
+            )
     elif mode == "delete":
         target, suggestions = resolve_keyword_for_action(text)
         if target and delete_keyword(target):
@@ -1594,9 +1632,19 @@ async def handle_admin_text(chat_id: int, text: str, message_id: Optional[int] =
     elif mode == "search":
         await show_keyword_search(chat_id, text)
     elif mode == "channel_add_public":
-        await show_admin_screen(chat_id, await add_channel_and_refresh(text, private=False) + "\n\n" + format_channel_list(), channel_list_keyboard())
+        result = await add_channel_and_refresh(text, private=False)
+        if "уже есть" in result:
+            ADMIN_MODES[chat_id] = "channel_add_public"
+            await show_admin_screen(chat_id, channel_add_prompt(False, result + " Отправьте другой канал."), back_keyboard("ch:list"))
+        else:
+            await show_admin_screen(chat_id, result + "\n\n" + format_channel_list(), channel_list_keyboard())
     elif mode == "channel_add_private":
-        await show_admin_screen(chat_id, await add_channel_and_refresh(text, private=True) + "\n\n" + format_channel_list(), channel_list_keyboard())
+        result = await add_channel_and_refresh(text, private=True)
+        if "уже есть" in result:
+            ADMIN_MODES[chat_id] = "channel_add_private"
+            await show_admin_screen(chat_id, channel_add_prompt(True, result + " Отправьте другой канал."), back_keyboard("ch:list"))
+        else:
+            await show_admin_screen(chat_id, result + "\n\n" + format_channel_list(), channel_list_keyboard())
     elif mode == "channel_delete":
         target, suggestions = resolve_channel_for_action(text)
         if target:
@@ -1652,7 +1700,11 @@ async def handle_admin_text(chat_id: int, text: str, message_id: Optional[int] =
     elif text.startswith("/start") or text.startswith("/menu"):
         await send_admin_menu(chat_id)
     elif text.startswith("/add "):
-        await show_admin_screen(chat_id, "Добавил." if add_keyword(text[5:]) else "Такой ключ уже есть или текст пустой.", keyword_list_keyboard())
+        await show_admin_screen(
+            chat_id,
+            "Добавил." if add_keyword(text[5:]) else "Такой ключ уже есть или текст пустой. Можно отправить /add с другим ключом или открыть «Ключевые слова».",
+            keyword_list_keyboard(),
+        )
     elif text.startswith("/del "):
         await show_admin_screen(chat_id, "Удалил." if delete_keyword(text[5:]) else "Не нашёл такой ключ.", keyword_list_keyboard())
     elif text.startswith("/rename "):
@@ -1671,7 +1723,8 @@ async def handle_admin_text(chat_id: int, text: str, message_id: Optional[int] =
     elif text.startswith("/errors"):
         await show_errors(chat_id)
     elif text.startswith("/ch_add "):
-        await show_admin_screen(chat_id, await add_channel_and_refresh(text[8:]) + "\n\n" + format_channel_list(), channel_list_keyboard())
+        result = await add_channel_and_refresh(text[8:])
+        await show_admin_screen(chat_id, result + "\n\n" + format_channel_list(), channel_list_keyboard())
     elif text.startswith("/ch_del "):
         await show_admin_screen(chat_id, await delete_channel_and_refresh(text[8:]) + "\n\n" + format_channel_list(), channel_list_keyboard())
     elif text.startswith("/ch_label "):
@@ -1700,7 +1753,7 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
         await show_keyword_list(chat_id, message_id)
     elif data == "kw:add":
         ADMIN_MODES[chat_id] = "add"
-        await show_admin_screen(chat_id, "Отправьте ключевое слово или фразу.", back_keyboard("kw:list"), message_id)
+        await show_admin_screen(chat_id, keyword_add_prompt(), back_keyboard("kw:list"), message_id)
     elif data == "kw:delete":
         ADMIN_MODES[chat_id] = "delete"
         await show_admin_screen(
@@ -1737,27 +1790,10 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
         await show_admin_screen(chat_id, "Какой канал добавляем?", channel_type_keyboard(), message_id)
     elif data == "ch:add_public":
         ADMIN_MODES[chat_id] = "channel_add_public"
-        await show_admin_screen(
-            chat_id,
-            "Открытый канал.\n\n"
-            "Пришлите @username или ссылку. Метку можно написать через пробел.\n"
-            "Пример: @rian_ru РИА Новости\n"
-            "Пример: https://t.me/rian_ru РИА Новости\n"
-            "Если аккаунт Telethon не подписан, бот попробует подписаться сам.",
-            back_keyboard("ch:list"),
-            message_id,
-        )
+        await show_admin_screen(chat_id, channel_add_prompt(False), back_keyboard("ch:list"), message_id)
     elif data == "ch:add_private":
         ADMIN_MODES[chat_id] = "channel_add_private"
-        await show_admin_screen(
-            chat_id,
-            "Закрытый канал.\n\n"
-            "Лучше пришлите invite-ссылку вида https://t.me/+hash, метку можно написать через пробел.\n"
-            "Пример: https://t.me/+hash Закрытый канал\n"
-            "Если аккаунт уже состоит в канале, можно указать ID вида -1001234567890.",
-            back_keyboard("ch:list"),
-            message_id,
-        )
+        await show_admin_screen(chat_id, channel_add_prompt(True), back_keyboard("ch:list"), message_id)
     elif data == "ch:delete":
         ADMIN_MODES[chat_id] = "channel_delete"
         await show_admin_screen(
