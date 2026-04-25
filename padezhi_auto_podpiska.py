@@ -64,6 +64,7 @@ BOT_POOL_TIMEOUT = 60
 BOT_MEDIA_TIMEOUT = 300
 BOT_CONNECTION_POOL_SIZE = 32
 MEDIA_CAPTION_LIMIT = 1000
+MAX_AUTO_FLOOD_WAIT_SECONDS = 60
 
 word_re = re.compile(r"\w+", flags=re.UNICODE)
 
@@ -578,8 +579,15 @@ async def join_channel(channel: dict) -> bool:
         return True
     except FloodWaitError as exc:
         log.warning("FloodWait %ss для канала %s", exc.seconds, channel)
-        await asyncio.sleep(exc.seconds)
-        return await join_channel(channel)
+        if exc.seconds <= MAX_AUTO_FLOOD_WAIT_SECONDS:
+            await asyncio.sleep(exc.seconds)
+            return await join_channel(channel)
+        log.error(
+            "Слишком большой FloodWait (%ss), пропускаю вступление в канал %s, чтобы не остановить весь бот.",
+            exc.seconds,
+            channel,
+        )
+        return False
     except (InviteHashExpiredError, InviteHashInvalidError) as exc:
         log.error("Проблема с invite-ссылкой %s: %s", channel, exc)
         return False
@@ -1966,10 +1974,6 @@ async def main() -> None:
     except Exception as exc:
         log.error("Ошибка авторизации: %s", exc)
         return
-
-    for channel in CHANNELS:
-        await join_channel(channel)
-        await asyncio.sleep(0.2)
 
     await refresh_channel_filters()
     log.info("Слушаем каналы: %s", ", ".join(CHANNEL_ENTITIES.keys()))
