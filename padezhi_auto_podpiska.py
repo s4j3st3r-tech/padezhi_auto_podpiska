@@ -34,6 +34,7 @@ from telethon.errors.rpcerrorlist import (
 )
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.types import InputPeerChannel
 from telethon.extensions import html as telethon_html
 from telethon.utils import get_peer_id
 
@@ -169,8 +170,13 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 link TEXT,
                 channel_id INTEGER,
+                access_hash INTEGER,
+                username TEXT,
                 name TEXT,
                 custom_text TEXT,
+                last_check_status TEXT,
+                last_check_error TEXT,
+                last_check_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS state (
@@ -180,6 +186,21 @@ def init_db() -> None:
             );
             """
         )
+        ensure_channel_columns(conn)
+
+
+def ensure_channel_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(channels)").fetchall()}
+    columns = {
+        "access_hash": "INTEGER",
+        "username": "TEXT",
+        "last_check_status": "TEXT",
+        "last_check_error": "TEXT",
+        "last_check_at": "TEXT",
+    }
+    for name, column_type in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE channels ADD COLUMN {name} {column_type}")
 
 
 def table_is_empty(table: str) -> bool:
@@ -208,7 +229,11 @@ def load_keywords_from_db() -> List[str]:
 def load_channels_from_db() -> List[dict]:
     with db_connect() as conn:
         rows = conn.execute(
-            "SELECT link, channel_id, name, custom_text FROM channels ORDER BY id"
+            """
+            SELECT link, channel_id, access_hash, username, name, custom_text,
+                   last_check_status, last_check_error, last_check_at
+            FROM channels ORDER BY id
+            """
         ).fetchall()
 
     channels = []
@@ -216,12 +241,22 @@ def load_channels_from_db() -> List[dict]:
         channel = {}
         if row["channel_id"] is not None:
             channel["id"] = int(row["channel_id"])
+        if row["access_hash"] is not None:
+            channel["access_hash"] = int(row["access_hash"])
+        if row["username"]:
+            channel["username"] = row["username"]
         if row["link"]:
             channel["link"] = row["link"]
         if row["name"]:
             channel["name"] = row["name"]
         if row["custom_text"]:
             channel["custom_text"] = row["custom_text"]
+        if row["last_check_status"]:
+            channel["last_check_status"] = row["last_check_status"]
+        if row["last_check_error"]:
+            channel["last_check_error"] = row["last_check_error"]
+        if row["last_check_at"]:
+            channel["last_check_at"] = row["last_check_at"]
         channels.append(channel)
     return channels
 
@@ -341,6 +376,51 @@ def set_channel_label_db(reference: str, label: str) -> bool:
                 (label.strip(), str(channel.get("link"))),
             )
     return cur.rowcount > 0
+
+
+def update_channel_cache_db(
+    channel: dict,
+    channel_id: Optional[int] = None,
+    access_hash: Optional[int] = None,
+    username: Optional[str] = None,
+    title: Optional[str] = None,
+    status: Optional[str] = None,
+    error_text: Optional[str] = None,
+) -> None:
+    link = channel.get("link")
+    current_id = channel.get("id")
+    updates = []
+    values = []
+    if channel_id is not None:
+        updates.append("channel_id = ?")
+        values.append(int(channel_id))
+    if access_hash is not None:
+        updates.append("access_hash = ?")
+        values.append(int(access_hash))
+    if username:
+        updates.append("username = ?")
+        values.append(str(username))
+    if title:
+        updates.append("name = COALESCE(NULLIF(name, ''), ?)")
+        values.append(str(title))
+    if status is not None:
+        updates.append("last_check_status = ?")
+        values.append(status)
+        updates.append("last_check_at = CURRENT_TIMESTAMP")
+    if error_text is not None:
+        updates.append("last_check_error = ?")
+        values.append(str(error_text)[:500])
+
+    if not updates:
+        return
+
+    with db_connect() as conn:
+        if link:
+            values.append(str(link))
+            conn.execute(f"UPDATE channels SET {', '.join(updates)} WHERE lower(link) = lower(?)", values)
+        elif current_id is not None:
+            values.append(int(current_id))
+            conn.execute(f"UPDATE channels SET {', '.join(updates)} WHERE channel_id = ?", values)
 
 
 def get_state(key: str, default: str = "0") -> str:
@@ -549,31 +629,82 @@ async def resolve_link_once(link: str):
     return entity
 
 
+def peer_channel_id(value: int) -> int:
+    text = str(value)
+    if text.startswith("-100"):
+        return int(text[4:])
+    return abs(int(value))
+
+
+def cached_channel_entity(channel: dict) -> Optional[InputPeerChannel]:
+    channel_id = channel.get("id")
+    access_hash = channel.get("access_hash")
+    if channel_id is None or access_hash is None:
+        return None
+    try:
+        return InputPeerChannel(peer_channel_id(int(channel_id)), int(access_hash))
+    except Exception:
+        return None
+
+
+def cache_entity_details(channel: dict, entity: Any, status: str = "ok", error_text: str = "") -> None:
+    try:
+        peer_id = get_peer_id(entity)
+    except Exception:
+        peer_id = channel.get("id")
+    access_hash = getattr(entity, "access_hash", None)
+    username = getattr(entity, "username", None) or channel.get("username")
+    title = getattr(entity, "title", None) or channel.get("name")
+    update_channel_cache_db(
+        channel,
+        channel_id=int(peer_id) if peer_id is not None else None,
+        access_hash=int(access_hash) if access_hash is not None else None,
+        username=username,
+        title=title,
+        status=status,
+        error_text=error_text,
+    )
+
+
 async def get_channel_entity(channel: dict):
+    cached = cached_channel_entity(channel)
+    if cached:
+        return cached
+
     if "id" in channel:
-        return await client.get_input_entity(channel["id"])
+        entity = await client.get_entity(channel["id"])
+        cache_entity_details(channel, entity)
+        return entity
     link = channel.get("link", "")
     if "joinchat" in link or "t.me/+" in link:
-        return await resolve_link_once(link)
+        entity = await resolve_link_once(link)
+        cache_entity_details(channel, entity)
+        return entity
     username = link.rsplit("/", 1)[-1].lstrip("@")
-    return await resolve_username_once(username)
+    entity = await resolve_link_once(username)
+    cache_entity_details(channel, entity)
+    return entity
 
 
 async def join_channel(channel: dict) -> bool:
     try:
         if "id" in channel:
-            entity = await client.get_input_entity(channel["id"])
+            entity = await client.get_entity(channel["id"])
             await client(JoinChannelRequest(entity))
+            cache_entity_details(channel, entity)
             return True
 
         link = channel.get("link", "")
         if "joinchat" in link or "t.me/+" in link:
             invite_hash = link.split("/")[-1].replace("+", "")
-            await client(ImportChatInviteRequest(invite_hash))
+            result = await client(ImportChatInviteRequest(invite_hash))
+            if getattr(result, "chats", None):
+                cache_entity_details(channel, result.chats[0])
             return True
 
         entity = await get_channel_entity(channel)
         await client(JoinChannelRequest(entity))
+        cache_entity_details(channel, entity)
         return True
     except UserAlreadyParticipantError:
         return True
@@ -1334,6 +1465,7 @@ def channel_list_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Проверить", callback_data="ch:check"),
             ],
             [InlineKeyboardButton("Статус всех каналов", callback_data="ch:status_all")],
+            [InlineKeyboardButton("Подключить недоступные", callback_data="ch:connect_unavailable")],
             [
                 InlineKeyboardButton("Метка", callback_data="ch:label"),
                 InlineKeyboardButton("Найти", callback_data="ch:search"),
@@ -1582,9 +1714,11 @@ async def check_channel_status(channel: dict) -> Tuple[bool, Optional[Any], str]
         async for item in client.iter_messages(entity, limit=1):
             latest_id = item.id
             break
+        cache_entity_details(channel, entity, status="ok", error_text="")
         return True, entity, f"последний пост: {latest_id or 'нет'}"
     except Exception as exc:
         log.warning("Проверка статуса канала не прошла для %s: %s", channel, exc)
+        update_channel_cache_db(channel, status="error", error_text=str(exc))
         return False, None, str(exc)
 
 
@@ -1612,6 +1746,45 @@ async def show_all_channel_statuses(chat_id: int, message_id: Optional[int] = No
         await asyncio.sleep(0.2)
 
     lines.append("\n🟢 доступен, 🔴 недоступен")
+    await show_admin_screen(chat_id, "\n".join(lines), channel_list_keyboard(), message_id)
+
+
+async def connect_unavailable_channels(chat_id: int, message_id: Optional[int] = None) -> None:
+    if not CHANNELS:
+        await show_admin_screen(chat_id, "Каналы пока пустые.", channel_list_keyboard(), message_id)
+        return
+
+    lines = ["Подключение недоступных каналов:\n"]
+    await show_admin_screen(chat_id, "Подключение недоступных каналов:\n\nПроверяю список...", back_keyboard("ch:list"), message_id)
+
+    changed = False
+    for index, channel in enumerate(CHANNELS, 1):
+        ok, entity, _ = await check_channel_status(channel)
+        if ok:
+            lines.append(f"{index}. {format_channel_status_line(channel, True, entity)} уже доступен")
+            await show_admin_screen(chat_id, "\n".join(lines), back_keyboard("ch:list"), message_id)
+            continue
+
+        lines.append(f"{index}. {format_channel_status_line(channel, None)} пробую подключить...")
+        await show_admin_screen(chat_id, "\n".join(lines), back_keyboard("ch:list"), message_id)
+
+        joined = await join_channel(channel)
+        if joined:
+            changed = True
+            refresh_memory_from_db()
+            fresh_channel = CHANNELS[index - 1] if index - 1 < len(CHANNELS) else channel
+            ok, entity, _ = await check_channel_status(fresh_channel)
+            lines[-1] = f"{index}. {format_channel_status_line(fresh_channel, ok, entity)} {'подключен' if ok else 'добавлен, но пока не читается'}"
+        else:
+            lines[-1] = f"{index}. {format_channel_status_line(channel, False)} не подключился"
+        await show_admin_screen(chat_id, "\n".join(lines), back_keyboard("ch:list"), message_id)
+        await asyncio.sleep(0.5)
+
+    if changed:
+        refresh_memory_from_db()
+        await refresh_channel_filters()
+
+    lines.append("\nГотово. Большие FloodWait не ждём, чтобы бот не зависал.")
     await show_admin_screen(chat_id, "\n".join(lines), channel_list_keyboard(), message_id)
 
 
@@ -1919,6 +2092,9 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
     elif data == "ch:status_all":
         ADMIN_MODES.pop(chat_id, None)
         await show_all_channel_statuses(chat_id, message_id)
+    elif data == "ch:connect_unavailable":
+        ADMIN_MODES.pop(chat_id, None)
+        await connect_unavailable_channels(chat_id, message_id)
     elif data == "ch:add":
         await show_admin_screen(chat_id, "Какой канал добавляем?", channel_type_keyboard(), message_id)
     elif data == "ch:add_public":
