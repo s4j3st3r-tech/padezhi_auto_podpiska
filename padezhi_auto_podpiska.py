@@ -769,6 +769,10 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="menu:back")]])
+
+
 async def send_admin_menu(chat_id: int) -> None:
     await safe_send_text(
         "Панель управления.\n\n"
@@ -1025,18 +1029,21 @@ async def handle_admin_text(chat_id: int, text: str) -> None:
 
 async def handle_callback(chat_id: int, callback: Any) -> None:
     data = callback.data or ""
-    if data == "kw:add":
+    if data == "menu:back":
+        ADMIN_MODES.pop(chat_id, None)
+        await send_admin_menu(chat_id)
+    elif data == "kw:add":
         ADMIN_MODES[chat_id] = "add"
-        await safe_send_text("Отправьте ключевое слово или фразу.", chat_id)
+        await safe_send_text("Отправьте ключевое слово или фразу.", chat_id, reply_markup=back_keyboard())
     elif data == "kw:delete":
         ADMIN_MODES[chat_id] = "delete"
-        await safe_send_text("Отправьте точный ключ для удаления.", chat_id)
+        await safe_send_text("Отправьте точный ключ для удаления.", chat_id, reply_markup=back_keyboard())
     elif data == "kw:rename":
         ADMIN_MODES[chat_id] = "rename"
-        await safe_send_text("Формат: старое => новое", chat_id)
+        await safe_send_text("Формат: старое => новое", chat_id, reply_markup=back_keyboard())
     elif data == "kw:search":
         ADMIN_MODES[chat_id] = "search"
-        await safe_send_text("Отправьте часть ключа для поиска.", chat_id)
+        await safe_send_text("Отправьте часть ключа для поиска.", chat_id, reply_markup=back_keyboard())
     elif data == "kw:list":
         await send_keyword_list(chat_id)
     elif data == "kw:stats":
@@ -1049,19 +1056,20 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
             "https://t.me/+invite_hash | метка\n"
             "-1001234567890 | метка",
             chat_id,
+            reply_markup=back_keyboard(),
         )
     elif data == "ch:delete":
         ADMIN_MODES[chat_id] = "channel_delete"
-        await safe_send_text("Отправьте ссылку, @username или ID канала для удаления.", chat_id)
+        await safe_send_text("Отправьте ссылку, @username или ID канала для удаления.", chat_id, reply_markup=back_keyboard())
     elif data == "ch:check":
         ADMIN_MODES[chat_id] = "channel_check"
-        await safe_send_text("Отправьте ссылку, @username или ID канала для проверки.", chat_id)
+        await safe_send_text("Отправьте ссылку, @username или ID канала для проверки.", chat_id, reply_markup=back_keyboard())
     elif data == "ch:label":
         ADMIN_MODES[chat_id] = "channel_label"
-        await safe_send_text("Отправьте: ссылка_или_id => новая метка", chat_id)
+        await safe_send_text("Отправьте: ссылка_или_id => новая метка", chat_id, reply_markup=back_keyboard())
     elif data == "ch:search":
         ADMIN_MODES[chat_id] = "channel_search"
-        await safe_send_text("Отправьте часть ссылки, ID или метки канала.", chat_id)
+        await safe_send_text("Отправьте часть ссылки, ID или метки канала.", chat_id, reply_markup=back_keyboard())
     elif data == "ch:list":
         await send_channel_list(chat_id)
     elif data == "errors:last":
