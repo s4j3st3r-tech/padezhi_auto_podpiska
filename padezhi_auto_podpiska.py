@@ -489,6 +489,14 @@ def get_channel_custom_text(chat: Any) -> str:
     return ""
 
 
+def is_copy_protected(chat: Any, message: Any) -> bool:
+    return bool(
+        getattr(chat, "noforwards", False)
+        or getattr(message, "noforwards", False)
+        or getattr(getattr(message, "chat", None), "noforwards", False)
+    )
+
+
 def format_forward_text(chat: Any, message: Any, triggers: List[str], source_text: str) -> str:
     phrases, words = find_triggers(source_text)
     highlighted = highlight_text(source_text, phrases, words)
@@ -625,13 +633,16 @@ def compact_media_caption(text: str, fallback_title: str) -> str:
     if len(text) <= MEDIA_CAPTION_LIMIT:
         return text
 
-    plain = re.sub(r"<[^>]+>", "", text)
-    plain = html.unescape(plain)
-    prefix = f"{fallback_title}\nПодпись сокращена из-за лимита Telegram.\n\n"
-    available = MEDIA_CAPTION_LIMIT - len(prefix) - 3
-    if available < 100:
-        return html.escape(fallback_title[:MEDIA_CAPTION_LIMIT])
-    return html.escape(prefix + plain[:available].rstrip() + "...")
+    header, _, rest = text.partition("\n\n")
+    caption_parts = [header.rstrip(":")]
+    keyword_marker = "\n\nКлючевые слова: "
+    if keyword_marker in rest:
+        caption_parts.append("Ключевые слова: " + rest.rsplit(keyword_marker, 1)[1].strip())
+
+    caption = "\n\n".join(part for part in caption_parts if part)
+    if len(caption) <= MEDIA_CAPTION_LIMIT:
+        return caption
+    return caption[: MEDIA_CAPTION_LIMIT - 3].rstrip() + "..."
 
 
 def media_timeout_kwargs() -> dict:
@@ -662,6 +673,7 @@ async def safe_send_media(text: str, media_path: Path, media_kind: str) -> None:
 
 async def safe_send_media(text: str, media_path: Path, media_kind: str) -> None:
     caption = compact_media_caption(text, "Найден пост с медиа.")
+    should_send_full_text = len(text) > MEDIA_CAPTION_LIMIT
     for attempt in range(3):
         try:
             with media_path.open("rb") as media:
@@ -691,6 +703,8 @@ async def safe_send_media(text: str, media_path: Path, media_kind: str) -> None:
                             parse_mode="HTML",
                             **media_timeout_kwargs(),
                         )
+            if should_send_full_text:
+                await safe_send_text(text)
             return
         except (error.TimedOut, asyncio.TimeoutError, error.NetworkError) as exc:
             log.warning("Повтор отправки медиа %s/3 после таймаута: %s", attempt + 1, exc)
@@ -756,6 +770,7 @@ async def send_album_to_target(text: str, messages: List[Any]) -> None:
         return
 
     caption = compact_media_caption(text, "Найден альбом.")
+    should_send_full_text = len(text) > MEDIA_CAPTION_LIMIT
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = []
@@ -789,6 +804,8 @@ async def send_album_to_target(text: str, messages: List[Any]) -> None:
 
                     async with BOT_SEND_LOCK:
                         await bot.send_media_group(CONFIG.channel_chat_id, media_group, **media_timeout_kwargs())
+                    if should_send_full_text:
+                        await safe_send_text(text)
                     return
                 except (error.TimedOut, asyncio.TimeoutError, error.NetworkError) as exc:
                     log.warning("Повтор отправки альбома %s/3 после таймаута: %s", attempt + 1, exc)
@@ -818,6 +835,7 @@ async def forward_to_target(chat: Any, message: Any, text: str, album_messages: 
             if downloaded:
                 await safe_send_media(text, Path(downloaded), kind)
             else:
+                log.warning("Медиа не скачалось, отправляю доступный текст/ссылку: chat_id=%s message_id=%s", getattr(message, "chat_id", None), getattr(message, "id", None))
                 await safe_send_text(text)
     except Exception as exc:
         log.error("Не удалось переслать медиа: %s", exc)
@@ -836,6 +854,13 @@ async def collect_album_messages(entity: Any, grouped_id: int) -> List[Any]:
 async def process_and_maybe_forward(chat: Any, message: Any, entity: Any = None) -> None:
     if not message:
         return
+    protected = is_copy_protected(chat, message)
+    if protected:
+        log.info(
+            "Канал/пост с запретом копирования: chat_id=%s message_id=%s. Проверяю доступный текст, медиа не обхожу.",
+            getattr(message, "chat_id", None),
+            getattr(message, "id", None),
+        )
 
     grouped_id = getattr(message, "grouped_id", None)
     if grouped_id:
@@ -854,6 +879,8 @@ async def process_and_maybe_forward(chat: Any, message: Any, entity: Any = None)
         source_text = message_text(message).strip()
 
     if not source_text:
+        if protected:
+            log.info("В protected-посте нет доступного текста для проверки ключей: chat_id=%s message_id=%s", getattr(message, "chat_id", None), getattr(message, "id", None))
         return
 
     should, triggers = should_forward(source_text)
