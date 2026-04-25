@@ -34,6 +34,7 @@ from telethon.errors.rpcerrorlist import (
 )
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.extensions import html as telethon_html
 from telethon.utils import get_peer_id
 
 
@@ -470,6 +471,18 @@ def message_text(message: Any) -> str:
     return getattr(message, "text", None) or getattr(message, "message", None) or ""
 
 
+def message_html(message: Any) -> str:
+    text = message_text(message)
+    if not text:
+        return ""
+    entities = getattr(message, "entities", None) or []
+    try:
+        return telethon_html.unparse(text, entities)
+    except Exception as exc:
+        log.warning("Не удалось сохранить форматирование сообщения %s: %s", getattr(message, "id", None), exc)
+        return html.escape(text)
+
+
 def message_link_for(chat: Any, message_id: int) -> str:
     username = getattr(chat, "username", None)
     if username:
@@ -497,9 +510,7 @@ def is_copy_protected(chat: Any, message: Any) -> bool:
     )
 
 
-def format_forward_text(chat: Any, message: Any, triggers: List[str], source_text: str) -> str:
-    phrases, words = find_triggers(source_text)
-    highlighted = highlight_text(source_text, phrases, words)
+def format_forward_text(chat: Any, message: Any, triggers: List[str], source_html: str) -> str:
     message_link = message_link_for(chat, message.id)
     title = html.escape(getattr(chat, "title", "Источник"))
     custom_text = html.escape(get_channel_custom_text(chat))
@@ -512,7 +523,7 @@ def format_forward_text(chat: Any, message: Any, triggers: List[str], source_tex
     if triggers:
         safe_triggers = [html.escape(item) for item in sorted(set(triggers))]
         tail = "\n\nКлючевые слова: " + ", ".join(safe_triggers)
-    return f"{header}:\n\n{highlighted}{tail}"
+    return f"{header}:\n\n{source_html}{tail}"
 
 
 async def resolve_username_once(username: str):
@@ -872,11 +883,13 @@ async def process_and_maybe_forward(chat: Any, message: Any, entity: Any = None)
         for album_message in album_messages:
             remember_processed((album_message.chat_id, album_message.id))
         source_text = "\n\n".join(message_text(item) for item in album_messages if message_text(item)).strip()
+        source_html = "\n\n".join(message_html(item) for item in album_messages if message_text(item)).strip()
     else:
         if not remember_processed((message.chat_id, message.id)):
             return
         album_messages = None
         source_text = message_text(message).strip()
+        source_html = message_html(message).strip()
 
     if not source_text:
         if protected:
@@ -888,7 +901,7 @@ async def process_and_maybe_forward(chat: Any, message: Any, entity: Any = None)
     if not should:
         return
 
-    text = format_forward_text(chat, message, triggers, source_text)
+    text = format_forward_text(chat, message, triggers, source_html or html.escape(source_text))
     await forward_to_target(chat, message, text, album_messages)
 
 
