@@ -1399,11 +1399,11 @@ def format_numbered_items(items: List[str], title: str = "Варианты") -> 
 
 
 def prompt_with_keyword_list(prompt: str) -> str:
-    return f"{prompt}\n\n{format_keyword_list()}"
+    return f"{format_keyword_list()}\n\n{prompt}"
 
 
 def prompt_with_channel_list(prompt: str) -> str:
-    return f"{prompt}\n\n{format_channel_list()}"
+    return f"{format_channel_list()}\n\n{prompt}"
 
 
 def resolve_keyword_for_action(reference: str) -> Tuple[Optional[str], List[str]]:
@@ -1453,13 +1453,13 @@ def resolve_channel_for_action(reference: str) -> Tuple[Optional[str], List[Tupl
 
 def split_reference_and_value(payload: str) -> Tuple[str, str]:
     payload = payload.strip()
+    if " - " in payload:
+        left, right = payload.split(" - ", 1)
+        return left.strip(), right.strip()
     if "=>" in payload:
         left, right = payload.split("=>", 1)
         return left.strip(), right.strip()
-    left, separator, right = payload.partition(" ")
-    if not separator:
-        return payload, ""
-    return left.strip(), right.strip()
+    return payload, ""
 
 
 async def show_keyword_search(chat_id: int, query: str) -> None:
@@ -1572,9 +1572,9 @@ async def handle_admin_text(chat_id: int, text: str, message_id: Optional[int] =
             await show_admin_screen(
                 chat_id,
                 prompt_with_keyword_list(
-                    "Напишите через пробел: номер новое_название\n"
-                    "Пример: 3 Астраханская область\n"
-                    "Можно и так: старое название => новое название"
+                    "Чтобы изменить, выберите цифру или напишите текущее название, затем через дефис новое название.\n"
+                    "Пример: 2 - Пенза\n"
+                    "Пример: Астраханская область - Знаменский район"
                 ),
                 back_keyboard("kw:list"),
             )
@@ -1616,9 +1616,9 @@ async def handle_admin_text(chat_id: int, text: str, message_id: Optional[int] =
             await show_admin_screen(
                 chat_id,
                 prompt_with_channel_list(
-                    "Напишите через пробел: номер новая_метка\n"
-                    "Пример: 2 РИА Новости\n"
-                    "Можно и так: @rian_ru => РИА Новости"
+                    "Чтобы поставить метку, выберите цифру или канал, затем через дефис новую метку.\n"
+                    "Пример: 2 - РИА Новости\n"
+                    "Пример: @rian_ru - РИА Новости"
                 ),
                 back_keyboard("ch:list"),
             )
@@ -1632,7 +1632,7 @@ async def handle_admin_text(chat_id: int, text: str, message_id: Optional[int] =
                 chat_id,
                 "Не нашёл канал. Вот похожие варианты, можно повторить с номером.\n\n"
                 + format_channel_matches(suggestions)
-                + "\n\nПример: 2 Новая метка",
+                + "\n\nПример: 2 - Новая метка",
                 back_keyboard("ch:list"),
             )
     elif mode == "channel_search":
@@ -1657,10 +1657,10 @@ async def handle_admin_text(chat_id: int, text: str, message_id: Optional[int] =
         await show_admin_screen(chat_id, "Удалил." if delete_keyword(text[5:]) else "Не нашёл такой ключ.", keyword_list_keyboard())
     elif text.startswith("/rename "):
         payload = text[8:].strip()
-        if "=>" not in payload:
-            await show_admin_screen(chat_id, "Формат: /rename старое => новое", keyword_list_keyboard())
+        old, new = split_reference_and_value(payload)
+        if not old or not new:
+            await show_admin_screen(chat_id, "Формат: /rename старое название - новое название", keyword_list_keyboard())
             return
-        old, new = [part.strip() for part in payload.split("=>", 1)]
         await show_admin_screen(chat_id, "Изменил." if rename_keyword(old, new) else "Не нашёл старый ключ.", keyword_list_keyboard())
     elif text.startswith("/search "):
         await show_keyword_search(chat_id, text[8:])
@@ -1675,7 +1675,9 @@ async def handle_admin_text(chat_id: int, text: str, message_id: Optional[int] =
     elif text.startswith("/ch_del "):
         await show_admin_screen(chat_id, await delete_channel_and_refresh(text[8:]) + "\n\n" + format_channel_list(), channel_list_keyboard())
     elif text.startswith("/ch_label "):
-        await show_admin_screen(chat_id, await set_channel_label_and_refresh(text[10:]) + "\n\n" + format_channel_list(), channel_list_keyboard())
+        reference, label = split_reference_and_value(text[10:])
+        payload = f"{reference} => {label}" if reference and label else text[10:]
+        await show_admin_screen(chat_id, await set_channel_label_and_refresh(payload) + "\n\n" + format_channel_list(), channel_list_keyboard())
     elif text.startswith("/ch_check "):
         await show_admin_screen(chat_id, await check_channel_access(resolve_channel_reference(text[10:]) or text[10:]), channel_list_keyboard())
     elif text.startswith("/ch_search "):
@@ -1703,12 +1705,12 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
         ADMIN_MODES[chat_id] = "delete"
         await show_admin_screen(
             chat_id,
-            prompt_with_keyword_list(
-                "Что удалить?\n"
-                "Отправьте номер из списка, точное название или часть названия.\n"
-                "Пример: 4\n"
-                "Пример: район"
-            ),
+                prompt_with_keyword_list(
+                    "Что удалить?\n"
+                    "Отправьте номер из списка, точное название или часть названия.\n"
+                    "Пример: 4\n"
+                    "Пример: район"
+                ),
             back_keyboard("kw:list"),
             message_id,
         )
@@ -1716,12 +1718,12 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
         ADMIN_MODES[chat_id] = "rename"
         await show_admin_screen(
             chat_id,
-            prompt_with_keyword_list(
-                "Что изменить?\n"
-                "Пишите через пробел: номер новое_название\n"
-                "Пример: 3 Астраханская область\n"
-                "Или старый вариант через стрелку: старое название => новое название"
-            ),
+                prompt_with_keyword_list(
+                    "Что изменить?\n"
+                    "Выберите цифру или напишите текущее название, затем через дефис новое название.\n"
+                    "Пример: 2 - Пенза\n"
+                    "Пример: Астраханская область - Знаменский район"
+                ),
             back_keyboard("kw:list"),
             message_id,
         )
@@ -1760,12 +1762,12 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
         ADMIN_MODES[chat_id] = "channel_delete"
         await show_admin_screen(
             chat_id,
-            prompt_with_channel_list(
-                "Что удалить?\n"
-                "Отправьте номер из списка, ссылку, @username, ID или часть метки.\n"
-                "Пример: 2\n"
-                "Пример: РИА"
-            ),
+                prompt_with_channel_list(
+                    "Что удалить?\n"
+                    "Отправьте номер из списка, ссылку, @username, ID, часть названия или часть метки.\n"
+                    "Пример: 2\n"
+                    "Пример: РИА"
+                ),
             back_keyboard("ch:list"),
             message_id,
         )
@@ -1773,11 +1775,11 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
         ADMIN_MODES[chat_id] = "channel_check"
         await show_admin_screen(
             chat_id,
-            prompt_with_channel_list(
-                "Что проверить?\n"
-                "Отправьте номер из списка, ссылку, @username, ID или часть метки.\n"
-                "Пример: 1"
-            ),
+                prompt_with_channel_list(
+                    "Что проверить?\n"
+                    "Отправьте номер из списка, ссылку, @username, ID, часть названия или часть метки.\n"
+                    "Пример: 1"
+                ),
             back_keyboard("ch:list"),
             message_id,
         )
@@ -1785,18 +1787,23 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
         ADMIN_MODES[chat_id] = "channel_label"
         await show_admin_screen(
             chat_id,
-            prompt_with_channel_list(
-                "Какую метку поставить?\n"
-                "Пишите через пробел: номер новая_метка\n"
-                "Пример: 2 РИА Новости\n"
-                "Или так: @rian_ru => РИА Новости"
-            ),
+                prompt_with_channel_list(
+                    "Какую метку поставить?\n"
+                    "Выберите цифру или канал, затем через дефис новую метку.\n"
+                    "Пример: 2 - РИА Новости\n"
+                    "Пример: @rian_ru - РИА Новости"
+                ),
             back_keyboard("ch:list"),
             message_id,
         )
     elif data == "ch:search":
         ADMIN_MODES[chat_id] = "channel_search"
-        await show_admin_screen(chat_id, "Отправьте часть ссылки, ID или метки канала.", back_keyboard("ch:list"), message_id)
+        await show_admin_screen(
+            chat_id,
+            "Отправьте часть ссылки, ID, username, названия канала или метки. Я покажу похожие каналы из списка.",
+            back_keyboard("ch:list"),
+            message_id,
+        )
     elif data == "stats:show":
         await show_stats(chat_id)
     elif data == "errors:last":
