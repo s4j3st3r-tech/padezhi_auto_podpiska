@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import html
 import json
 import logging
@@ -124,6 +125,7 @@ ALLOWED_IDS: Set[int] = set()
 ALLOWED_USERNAMES: Set[str] = set()
 ALLOWED_ID_STRINGS: Set[str] = set()
 ADMIN_MODES: Dict[int, str] = {}
+ADMIN_SCREEN_MESSAGES: Dict[int, int] = {}
 BOT_UPDATE_OFFSET = 0
 
 KEYWORDS: List[str] = []
@@ -215,6 +217,30 @@ def refresh_memory_from_db() -> None:
     rebuild_keyword_index()
 
 
+def resolve_list_number(value: str, total: int) -> Optional[int]:
+    value = value.strip()
+    if value.isdigit():
+        index = int(value) - 1
+        if 0 <= index < total:
+            return index
+    return None
+
+
+def resolve_keyword_reference(reference: str) -> Optional[str]:
+    index = resolve_list_number(reference, len(KEYWORDS))
+    if index is not None:
+        return KEYWORDS[index]
+    return None
+
+
+def resolve_channel_reference(reference: str) -> Optional[str]:
+    index = resolve_list_number(reference, len(CHANNELS))
+    if index is None:
+        return None
+    channel = CHANNELS[index]
+    return str(channel.get("link") or channel.get("id") or "")
+
+
 def add_keyword_db(text: str) -> bool:
     text = text.strip()
     if not text:
@@ -225,12 +251,14 @@ def add_keyword_db(text: str) -> bool:
 
 
 def delete_keyword_db(text: str) -> bool:
+    text = resolve_keyword_reference(text) or text
     with db_connect() as conn:
         cur = conn.execute("DELETE FROM keywords WHERE lower(text) = lower(?)", (text.strip(),))
         return cur.rowcount > 0
 
 
 def rename_keyword_db(old: str, new: str) -> bool:
+    old = resolve_keyword_reference(old) or old
     old = old.strip()
     new = new.strip()
     if not old or not new:
@@ -264,6 +292,7 @@ def add_channel_db(channel: dict) -> bool:
 
 
 def delete_channel_db(reference: str) -> Optional[dict]:
+    reference = resolve_channel_reference(reference) or reference
     index = find_channel_index(reference)
     if index is None:
         return None
@@ -279,6 +308,7 @@ def delete_channel_db(reference: str) -> Optional[dict]:
 
 
 def set_channel_label_db(reference: str, label: str) -> bool:
+    reference = resolve_channel_reference(reference) or reference
     index = find_channel_index(reference)
     if index is None:
         return False
@@ -546,14 +576,13 @@ async def safe_send_text(text: str, chat_id: Optional[int] = None, reply_markup=
     for attempt in range(3):
         try:
             await asyncio.sleep(SEND_DELAY)
-            await bot.send_message(
+            return await bot.send_message(
                 chat_id=target,
                 text=text[:4096],
                 parse_mode="HTML",
                 disable_web_page_preview=True,
                 reply_markup=reply_markup,
             )
-            return
         except (error.TimedOut, asyncio.TimeoutError):
             await asyncio.sleep(2**attempt)
         except Exception as exc:
@@ -1079,6 +1108,372 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
     await answer_callback(callback)
 
 
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Ключевые слова", callback_data="kw:list")],
+            [InlineKeyboardButton("Каналы", callback_data="ch:list")],
+            [
+                InlineKeyboardButton("Статус", callback_data="stats:show"),
+                InlineKeyboardButton("Ошибки", callback_data="errors:last"),
+            ],
+            [InlineKeyboardButton("Перезагрузить", callback_data="all:reload")],
+        ]
+    )
+
+
+def keyword_list_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Добавить", callback_data="kw:add"),
+                InlineKeyboardButton("Убрать", callback_data="kw:delete"),
+            ],
+            [
+                InlineKeyboardButton("Изменить", callback_data="kw:rename"),
+                InlineKeyboardButton("Найти", callback_data="kw:search"),
+            ],
+            [InlineKeyboardButton("Назад", callback_data="menu:back")],
+        ]
+    )
+
+
+def channel_list_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Добавить канал", callback_data="ch:add")],
+            [
+                InlineKeyboardButton("Убрать", callback_data="ch:delete"),
+                InlineKeyboardButton("Проверить", callback_data="ch:check"),
+            ],
+            [
+                InlineKeyboardButton("Метка", callback_data="ch:label"),
+                InlineKeyboardButton("Найти", callback_data="ch:search"),
+            ],
+            [InlineKeyboardButton("Назад", callback_data="menu:back")],
+        ]
+    )
+
+
+def channel_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Открытый канал", callback_data="ch:add_public")],
+            [InlineKeyboardButton("Закрытый канал", callback_data="ch:add_private")],
+            [InlineKeyboardButton("Назад", callback_data="ch:list")],
+        ]
+    )
+
+
+def back_keyboard(target: str = "menu:back") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data=target)]])
+
+
+async def delete_message_quiet(chat_id: int, message_id: Optional[int]) -> None:
+    if not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def show_admin_screen(
+    chat_id: int,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    message_id: Optional[int] = None,
+) -> None:
+    target_message_id = message_id or ADMIN_SCREEN_MESSAGES.get(chat_id)
+    if target_message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=target_message_id,
+                text=text[:4096],
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
+            )
+            ADMIN_SCREEN_MESSAGES[chat_id] = target_message_id
+            return
+        except Exception:
+            await delete_message_quiet(chat_id, target_message_id)
+
+    message = await safe_send_text(text, chat_id=chat_id, reply_markup=reply_markup)
+    if message:
+        ADMIN_SCREEN_MESSAGES[chat_id] = message.message_id
+
+
+async def send_admin_menu(chat_id: int, message_id: Optional[int] = None) -> None:
+    ADMIN_MODES.pop(chat_id, None)
+    await show_admin_screen(
+        chat_id,
+        "Панель управления.\n\nВыберите раздел. Списки, добавление, удаление и поиск теперь лежат внутри разделов.",
+        admin_keyboard(),
+        message_id,
+    )
+
+
+def format_keyword_list(limit: int = 80) -> str:
+    if not KEYWORDS:
+        return "Ключевые слова пока пустые."
+    lines = [f"{index + 1}. {html.escape(value)}" for index, value in enumerate(KEYWORDS[:limit])]
+    if len(KEYWORDS) > limit:
+        lines.append(f"\n...и еще {len(KEYWORDS) - limit}. Используйте «Найти».")
+    return "Ключевые слова:\n\n" + "\n".join(lines)
+
+
+async def show_keyword_list(chat_id: int, message_id: Optional[int] = None) -> None:
+    await show_admin_screen(chat_id, format_keyword_list(), keyword_list_keyboard(), message_id)
+
+
+def keyword_search_matches(query: str) -> List[str]:
+    query = query.strip()
+    if not query:
+        return []
+    query_cf = query.casefold()
+    query_words = word_re.findall(query.lower())
+    query_lemmas = {lemma(word) for word in query_words}
+    matches = []
+    for item in KEYWORDS:
+        item_cf = item.casefold()
+        item_words = word_re.findall(item.lower())
+        item_lemmas = {lemma(word) for word in item_words}
+        if query_cf in item_cf or query_lemmas & item_lemmas:
+            matches.append(item)
+    return matches or difflib.get_close_matches(query, KEYWORDS, n=10, cutoff=0.55)
+
+
+async def show_keyword_search(chat_id: int, query: str) -> None:
+    matches = keyword_search_matches(query)
+    if not matches:
+        await show_admin_screen(chat_id, "Ничего не нашёл по ключевым словам.", keyword_list_keyboard())
+        return
+    lines = [f"{index + 1}. {html.escape(value)}" for index, value in enumerate(matches[:50])]
+    await show_admin_screen(chat_id, "Нашёл ключи:\n\n" + "\n".join(lines), keyword_list_keyboard())
+
+
+def format_channel_list(limit: int = 80) -> str:
+    if not CHANNELS:
+        return "Каналы пока пустые."
+    lines = []
+    for index, channel in enumerate(CHANNELS[:limit], 1):
+        ref = channel.get("link") or channel.get("id")
+        label = channel.get("custom_text") or channel.get("name") or ""
+        suffix = f" | {html.escape(str(label))}" if label else ""
+        lines.append(f"{index}. {html.escape(str(ref))}{suffix}")
+    if len(CHANNELS) > limit:
+        lines.append(f"\n...и еще {len(CHANNELS) - limit}. Используйте «Найти».")
+    return "Каналы:\n\n" + "\n".join(lines)
+
+
+async def show_channel_list(chat_id: int, message_id: Optional[int] = None) -> None:
+    await show_admin_screen(chat_id, format_channel_list(), channel_list_keyboard(), message_id)
+
+
+async def show_channel_search(chat_id: int, query: str) -> None:
+    query_cf = query.strip().casefold()
+    matches = []
+    for index, channel in enumerate(CHANNELS, 1):
+        haystack = " ".join(str(value) for value in channel.values()).casefold()
+        if query_cf and query_cf in haystack:
+            matches.append((index, channel))
+    if not matches:
+        await show_admin_screen(chat_id, "Ничего не нашёл по каналам.", channel_list_keyboard())
+        return
+    lines = []
+    for index, channel in matches[:50]:
+        ref = channel.get("link") or channel.get("id")
+        label = channel.get("custom_text") or channel.get("name") or ""
+        suffix = f" | {html.escape(str(label))}" if label else ""
+        lines.append(f"{index}. {html.escape(str(ref))}{suffix}")
+    await show_admin_screen(chat_id, "Нашёл каналы:\n\n" + "\n".join(lines), channel_list_keyboard())
+
+
+async def show_stats(chat_id: int) -> None:
+    await show_admin_screen(
+        chat_id,
+        "Статус:\n"
+        f"Ключей: {len(KEYWORDS)}\n"
+        f"Каналов в базе: {len(CHANNELS)}\n"
+        f"Каналов подключено: {len(CHANNEL_ENTITIES)}\n"
+        f"Однословных лемм: {len(SINGLE_WORD_LEMMAS)}\n"
+        f"Фраз: {len(PHRASES_LC)}\n"
+        f"Обработано в памяти: {len(PROCESSED_LOOKUP)}\n"
+        f"База: {html.escape(str(DB_PATH.name))}",
+        back_keyboard(),
+    )
+
+
+async def show_errors(chat_id: int) -> None:
+    if not ERROR_LOG_PATH.exists():
+        await show_admin_screen(chat_id, "Файл ошибок пока пуст.", back_keyboard())
+        return
+    lines = ERROR_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+    await show_admin_screen(chat_id, "Последние ошибки:\n\n" + html.escape("\n".join(lines) or "Ошибок нет."), back_keyboard())
+
+
+def parse_channel_payload(payload: str, private: bool = False) -> dict:
+    channel = parse_channel_input(payload)
+    if private and "link" in channel and "t.me/+" not in channel["link"] and "joinchat" not in channel["link"]:
+        raise ValueError("Для закрытого канала пришлите invite-ссылку вида https://t.me/+hash или ID -100..., если аккаунт уже состоит в канале.")
+    return channel
+
+
+async def add_channel_and_refresh(text: str, private: bool = False) -> str:
+    try:
+        channel = parse_channel_payload(text, private=private)
+    except ValueError as exc:
+        return str(exc)
+    if not add_channel_db(channel):
+        return "Такой канал уже есть."
+    refresh_memory_from_db()
+    joined = await join_channel(channel)
+    await refresh_channel_filters()
+    if joined:
+        return "Канал добавлен. Если он был открытый или была рабочая invite-ссылка, аккаунт Telethon уже попробовал подписаться."
+    return "Канал сохранён, но пока недоступен. Проверьте ссылку/ID и доступ аккаунта Telethon."
+
+
+async def handle_admin_text(chat_id: int, text: str, message_id: Optional[int] = None) -> None:
+    text = text.strip()
+    mode = ADMIN_MODES.pop(chat_id, "")
+    await delete_message_quiet(chat_id, message_id)
+
+    if mode == "add":
+        result = "Добавил." if add_keyword(text) else "Такой ключ уже есть или текст пустой."
+        await show_admin_screen(chat_id, result + "\n\n" + format_keyword_list(), keyword_list_keyboard())
+    elif mode == "delete":
+        result = "Удалил." if delete_keyword(text) else "Не нашёл такой ключ. Можно указать номер из списка или точное название."
+        await show_admin_screen(chat_id, result + "\n\n" + format_keyword_list(), keyword_list_keyboard())
+    elif mode == "rename":
+        if "=>" not in text:
+            ADMIN_MODES[chat_id] = "rename"
+            await show_admin_screen(chat_id, "Формат: номер_или_старое_название => новое название", back_keyboard("kw:list"))
+            return
+        old, new = [part.strip() for part in text.split("=>", 1)]
+        result = "Изменил." if rename_keyword(old, new) else "Не нашёл старый ключ."
+        await show_admin_screen(chat_id, result + "\n\n" + format_keyword_list(), keyword_list_keyboard())
+    elif mode == "search":
+        await show_keyword_search(chat_id, text)
+    elif mode == "channel_add_public":
+        await show_admin_screen(chat_id, await add_channel_and_refresh(text, private=False) + "\n\n" + format_channel_list(), channel_list_keyboard())
+    elif mode == "channel_add_private":
+        await show_admin_screen(chat_id, await add_channel_and_refresh(text, private=True) + "\n\n" + format_channel_list(), channel_list_keyboard())
+    elif mode == "channel_delete":
+        await show_admin_screen(chat_id, await delete_channel_and_refresh(text) + "\n\n" + format_channel_list(), channel_list_keyboard())
+    elif mode == "channel_label":
+        if "=>" not in text:
+            ADMIN_MODES[chat_id] = "channel_label"
+            await show_admin_screen(chat_id, "Формат: номер_или_канал => новая метка", back_keyboard("ch:list"))
+            return
+        await show_admin_screen(chat_id, await set_channel_label_and_refresh(text) + "\n\n" + format_channel_list(), channel_list_keyboard())
+    elif mode == "channel_search":
+        await show_channel_search(chat_id, text)
+    elif mode == "channel_check":
+        await show_admin_screen(chat_id, await check_channel_access(resolve_channel_reference(text) or text), channel_list_keyboard())
+    elif text.startswith("/start") or text.startswith("/menu"):
+        await send_admin_menu(chat_id)
+    elif text.startswith("/add "):
+        await show_admin_screen(chat_id, "Добавил." if add_keyword(text[5:]) else "Такой ключ уже есть или текст пустой.", keyword_list_keyboard())
+    elif text.startswith("/del "):
+        await show_admin_screen(chat_id, "Удалил." if delete_keyword(text[5:]) else "Не нашёл такой ключ.", keyword_list_keyboard())
+    elif text.startswith("/rename "):
+        payload = text[8:].strip()
+        if "=>" not in payload:
+            await show_admin_screen(chat_id, "Формат: /rename старое => новое", keyword_list_keyboard())
+            return
+        old, new = [part.strip() for part in payload.split("=>", 1)]
+        await show_admin_screen(chat_id, "Изменил." if rename_keyword(old, new) else "Не нашёл старый ключ.", keyword_list_keyboard())
+    elif text.startswith("/search "):
+        await show_keyword_search(chat_id, text[8:])
+    elif text.startswith("/list"):
+        await show_keyword_list(chat_id)
+    elif text.startswith("/stats"):
+        await show_stats(chat_id)
+    elif text.startswith("/errors"):
+        await show_errors(chat_id)
+    elif text.startswith("/ch_add "):
+        await show_admin_screen(chat_id, await add_channel_and_refresh(text[8:]) + "\n\n" + format_channel_list(), channel_list_keyboard())
+    elif text.startswith("/ch_del "):
+        await show_admin_screen(chat_id, await delete_channel_and_refresh(text[8:]) + "\n\n" + format_channel_list(), channel_list_keyboard())
+    elif text.startswith("/ch_label "):
+        await show_admin_screen(chat_id, await set_channel_label_and_refresh(text[10:]) + "\n\n" + format_channel_list(), channel_list_keyboard())
+    elif text.startswith("/ch_check "):
+        await show_admin_screen(chat_id, await check_channel_access(resolve_channel_reference(text[10:]) or text[10:]), channel_list_keyboard())
+    elif text.startswith("/ch_search "):
+        await show_channel_search(chat_id, text[11:])
+    elif text.startswith("/ch_list"):
+        await show_channel_list(chat_id)
+    elif text.startswith("/reload") or text.startswith("/ch_reload"):
+        await show_admin_screen(chat_id, await reload_all_from_db(), admin_keyboard())
+    else:
+        await send_admin_menu(chat_id)
+
+
+async def handle_callback(chat_id: int, callback: Any) -> None:
+    data = callback.data or ""
+    message_id = callback.message.message_id if callback.message else None
+    if data == "menu:back":
+        await send_admin_menu(chat_id, message_id)
+    elif data == "kw:list":
+        ADMIN_MODES.pop(chat_id, None)
+        await show_keyword_list(chat_id, message_id)
+    elif data == "kw:add":
+        ADMIN_MODES[chat_id] = "add"
+        await show_admin_screen(chat_id, "Отправьте ключевое слово или фразу.", back_keyboard("kw:list"), message_id)
+    elif data == "kw:delete":
+        ADMIN_MODES[chat_id] = "delete"
+        await show_admin_screen(chat_id, "Отправьте номер из списка или точное название ключа для удаления.", back_keyboard("kw:list"), message_id)
+    elif data == "kw:rename":
+        ADMIN_MODES[chat_id] = "rename"
+        await show_admin_screen(chat_id, "Отправьте: номер_или_старое_название => новое название", back_keyboard("kw:list"), message_id)
+    elif data == "kw:search":
+        ADMIN_MODES[chat_id] = "search"
+        await show_admin_screen(chat_id, "Отправьте часть слова. Я учту леммы и похожие варианты.", back_keyboard("kw:list"), message_id)
+    elif data == "ch:list":
+        ADMIN_MODES.pop(chat_id, None)
+        await show_channel_list(chat_id, message_id)
+    elif data == "ch:add":
+        await show_admin_screen(chat_id, "Какой канал добавляем?", channel_type_keyboard(), message_id)
+    elif data == "ch:add_public":
+        ADMIN_MODES[chat_id] = "channel_add_public"
+        await show_admin_screen(
+            chat_id,
+            "Открытый канал.\n\nПришлите @username или ссылку, можно с меткой через |.\nПример: @rian_ru | РИА\nЕсли аккаунт Telethon не подписан, бот попробует подписаться сам.",
+            back_keyboard("ch:list"),
+            message_id,
+        )
+    elif data == "ch:add_private":
+        ADMIN_MODES[chat_id] = "channel_add_private"
+        await show_admin_screen(
+            chat_id,
+            "Закрытый канал.\n\nЛучше пришлите invite-ссылку вида https://t.me/+hash, можно с меткой через |.\nЕсли аккаунт уже состоит в канале, можно указать ID вида -1001234567890.",
+            back_keyboard("ch:list"),
+            message_id,
+        )
+    elif data == "ch:delete":
+        ADMIN_MODES[chat_id] = "channel_delete"
+        await show_admin_screen(chat_id, "Отправьте номер из списка, ссылку, @username или ID канала для удаления.", back_keyboard("ch:list"), message_id)
+    elif data == "ch:check":
+        ADMIN_MODES[chat_id] = "channel_check"
+        await show_admin_screen(chat_id, "Отправьте номер из списка, ссылку, @username или ID канала для проверки.", back_keyboard("ch:list"), message_id)
+    elif data == "ch:label":
+        ADMIN_MODES[chat_id] = "channel_label"
+        await show_admin_screen(chat_id, "Отправьте: номер_или_канал => новая метка", back_keyboard("ch:list"), message_id)
+    elif data == "ch:search":
+        ADMIN_MODES[chat_id] = "channel_search"
+        await show_admin_screen(chat_id, "Отправьте часть ссылки, ID или метки канала.", back_keyboard("ch:list"), message_id)
+    elif data == "stats:show":
+        await show_stats(chat_id)
+    elif data == "errors:last":
+        await show_errors(chat_id)
+    elif data == "all:reload":
+        await show_admin_screen(chat_id, await reload_all_from_db(), admin_keyboard(), message_id)
+    await answer_callback(callback)
+
+
 async def bot_control_loop() -> None:
     global BOT_UPDATE_OFFSET
     while True:
@@ -1099,7 +1494,7 @@ async def bot_control_loop() -> None:
                 elif update.message and update.message.text:
                     chat_id = update.message.chat_id
                     if is_admin(chat_id):
-                        await handle_admin_text(chat_id, update.message.text)
+                        await handle_admin_text(chat_id, update.message.text, update.message.message_id)
                     else:
                         await safe_send_text("Нет доступа к управлению ботом.", chat_id)
         except Exception as exc:
