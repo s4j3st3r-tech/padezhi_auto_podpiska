@@ -183,6 +183,10 @@ def save_keywords() -> None:
     save_json(KEYWORDS_PATH, KEYWORDS)
 
 
+def save_channels() -> None:
+    save_json(CHANNELS_PATH, CHANNELS)
+
+
 def add_keyword(keyword: str) -> bool:
     keyword = keyword.strip()
     if not keyword:
@@ -558,19 +562,28 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("➕ Добавить", callback_data="kw:add"),
-                InlineKeyboardButton("➖ Удалить", callback_data="kw:delete"),
+                InlineKeyboardButton("Ключ +", callback_data="kw:add"),
+                InlineKeyboardButton("Ключ -", callback_data="kw:delete"),
             ],
             [
-                InlineKeyboardButton("✏️ Изменить", callback_data="kw:rename"),
-                InlineKeyboardButton("🔎 Найти", callback_data="kw:search"),
+                InlineKeyboardButton("Ключ изменить", callback_data="kw:rename"),
+                InlineKeyboardButton("Ключ найти", callback_data="kw:search"),
             ],
             [
-                InlineKeyboardButton("📋 Список", callback_data="kw:list"),
-                InlineKeyboardButton("📊 Статус", callback_data="kw:stats"),
+                InlineKeyboardButton("Ключи список", callback_data="kw:list"),
+                InlineKeyboardButton("Статус", callback_data="kw:stats"),
             ],
             [
-                InlineKeyboardButton("🔄 Перезагрузить", callback_data="kw:reload"),
+                InlineKeyboardButton("Канал +", callback_data="ch:add"),
+                InlineKeyboardButton("Канал -", callback_data="ch:delete"),
+            ],
+            [
+                InlineKeyboardButton("Канал метка", callback_data="ch:label"),
+                InlineKeyboardButton("Канал найти", callback_data="ch:search"),
+            ],
+            [
+                InlineKeyboardButton("Каналы список", callback_data="ch:list"),
+                InlineKeyboardButton("Перезагрузить", callback_data="all:reload"),
             ],
         ]
     )
@@ -585,7 +598,14 @@ async def send_admin_menu(chat_id: int) -> None:
         "/rename старое => новое\n"
         "/search часть_слова\n"
         "/list\n"
-        "/stats",
+        "/stats\n\n"
+        "Каналы:\n"
+        "/ch_add @username | метка\n"
+        "/ch_add https://t.me/+invite_hash | метка\n"
+        "/ch_add -1001234567890 | метка\n"
+        "/ch_del ссылка_или_id\n"
+        "/ch_label ссылка_или_id => новая метка\n"
+        "/ch_list",
         chat_id=chat_id,
         reply_markup=admin_keyboard(),
     )
@@ -621,6 +641,18 @@ async def handle_admin_text(chat_id: int, text: str) -> None:
     if mode == "search":
         await send_keyword_search(chat_id, text)
         return
+    if mode == "channel_add":
+        await safe_send_text(await add_channel_and_refresh(text), chat_id)
+        return
+    if mode == "channel_delete":
+        await safe_send_text(await delete_channel_and_refresh(text), chat_id)
+        return
+    if mode == "channel_label":
+        await safe_send_text(await set_channel_label_and_refresh(text), chat_id)
+        return
+    if mode == "channel_search":
+        await send_channel_search(chat_id, text)
+        return
 
     if text.startswith("/start") or text.startswith("/menu"):
         await send_admin_menu(chat_id)
@@ -647,6 +679,18 @@ async def handle_admin_text(chat_id: int, text: str) -> None:
     elif text.startswith("/reload"):
         reload_keywords_from_file()
         await safe_send_text("Перезагрузил keywords.json.", chat_id)
+    elif text.startswith("/ch_add "):
+        await safe_send_text(await add_channel_and_refresh(text[8:]), chat_id)
+    elif text.startswith("/ch_del "):
+        await safe_send_text(await delete_channel_and_refresh(text[8:]), chat_id)
+    elif text.startswith("/ch_label "):
+        await safe_send_text(await set_channel_label_and_refresh(text[10:]), chat_id)
+    elif text.startswith("/ch_search "):
+        await send_channel_search(chat_id, text[11:])
+    elif text.startswith("/ch_list"):
+        await send_channel_list(chat_id)
+    elif text.startswith("/ch_reload"):
+        await safe_send_text(await reload_channels_and_refresh(), chat_id)
     else:
         await send_admin_menu(chat_id)
 
@@ -688,6 +732,171 @@ def reload_keywords_from_file() -> None:
     rebuild_keyword_index()
 
 
+def parse_channel_input(text: str) -> dict:
+    raw = text.strip()
+    if not raw:
+        raise ValueError("Введите ссылку, @username, invite-ссылку или ID канала.")
+
+    custom_text = ""
+    name = ""
+    if "|" in raw:
+        raw, custom_text = [part.strip() for part in raw.split("|", 1)]
+
+    if raw.lstrip("-").isdigit():
+        channel = {"id": int(raw)}
+    else:
+        link = raw.strip()
+        if link.startswith("@"):
+            link = f"https://t.me/{link[1:]}"
+        elif link.startswith("t.me/"):
+            link = f"https://{link}"
+        elif not link.startswith(("https://t.me/", "http://t.me/")):
+            link = f"https://t.me/{link.lstrip('/')}"
+        channel = {"link": link}
+        name = link.rsplit("/", 1)[-1]
+
+    if name:
+        channel["name"] = name
+    if custom_text:
+        channel["custom_text"] = custom_text
+    return channel
+
+
+def channel_keys(channel: dict) -> Set[str]:
+    keys = set()
+    if "id" in channel:
+        keys.add(str(channel["id"]))
+    link = channel.get("link")
+    if link:
+        normalized = str(link).strip()
+        keys.add(normalized.casefold())
+        keys.add(normalized.replace("https://", "").replace("http://", "").casefold())
+        keys.add(normalized.rsplit("/", 1)[-1].lstrip("@").casefold())
+    return {key for key in keys if key}
+
+
+def find_channel_index(reference: str) -> Optional[int]:
+    try:
+        target = parse_channel_input(reference)
+    except ValueError:
+        target = {"link": reference.strip()}
+    target_keys = channel_keys(target)
+    for index, channel in enumerate(CHANNELS):
+        if channel_keys(channel) & target_keys:
+            return index
+    return None
+
+
+def add_channel_config(text: str) -> Tuple[bool, str, Optional[dict]]:
+    try:
+        channel = parse_channel_input(text)
+    except ValueError as exc:
+        return False, str(exc), None
+
+    if find_channel_index(str(channel.get("id") or channel.get("link"))) is not None:
+        return False, "Такой канал уже есть в channels.json.", None
+
+    CHANNELS.append(channel)
+    save_channels()
+    return True, "Канал добавлен.", channel
+
+
+def delete_channel_config(reference: str) -> Tuple[bool, str]:
+    index = find_channel_index(reference)
+    if index is None:
+        return False, "Не нашёл такой канал."
+    removed = CHANNELS.pop(index)
+    save_channels()
+    return True, f"Удалил: {html.escape(str(removed.get('link') or removed.get('id')))}"
+
+
+def set_channel_label(reference: str, label: str) -> Tuple[bool, str]:
+    index = find_channel_index(reference)
+    if index is None:
+        return False, "Не нашёл такой канал."
+    CHANNELS[index]["custom_text"] = label.strip()
+    save_channels()
+    return True, "Метка канала обновлена."
+
+
+async def refresh_channel_filters() -> None:
+    global CHANNEL_ENTITIES, ALLOWED_IDS, ALLOWED_USERNAMES, ALLOWED_ID_STRINGS
+    CHANNEL_ENTITIES, ALLOWED_IDS, ALLOWED_USERNAMES, ALLOWED_ID_STRINGS = await build_filters()
+
+
+async def add_channel_and_refresh(text: str) -> str:
+    added, message, channel = add_channel_config(text)
+    if not added or not channel:
+        return message
+
+    joined = await join_channel(channel)
+    await refresh_channel_filters()
+    if joined:
+        return "Канал добавлен и подключён."
+    return "Канал сохранён, но подключиться сразу не удалось. Проверьте ссылку/ID и подписку аккаунта."
+
+
+async def delete_channel_and_refresh(reference: str) -> str:
+    ok, message = delete_channel_config(reference)
+    if ok:
+        await refresh_channel_filters()
+    return message
+
+
+async def set_channel_label_and_refresh(payload: str) -> str:
+    if "=>" not in payload:
+        return "Формат: канал => новая метка"
+    reference, label = [part.strip() for part in payload.split("=>", 1)]
+    ok, message = set_channel_label(reference, label)
+    if ok:
+        await refresh_channel_filters()
+    return message
+
+
+def reload_channels_from_file() -> None:
+    CHANNELS[:] = load_json(CHANNELS_PATH)
+
+
+async def reload_channels_and_refresh() -> str:
+    reload_channels_from_file()
+    await refresh_channel_filters()
+    return "Перезагрузил channels.json."
+
+
+async def send_channel_list(chat_id: int) -> None:
+    lines = []
+    for index, channel in enumerate(CHANNELS, 1):
+        ref = channel.get("link") or channel.get("id")
+        label = channel.get("custom_text") or channel.get("name") or ""
+        suffix = f" | {html.escape(str(label))}" if label else ""
+        lines.append(f"{index}. {html.escape(str(ref))}{suffix}")
+    text = "Каналы:\n\n" + "\n".join(lines)
+    for start in range(0, len(text), 3500):
+        await safe_send_text(text[start : start + 3500], chat_id)
+
+
+async def send_channel_search(chat_id: int, query: str) -> None:
+    query_cf = query.strip().casefold()
+    if not query_cf:
+        await safe_send_text("Введите часть ссылки, ID или метки канала.", chat_id)
+        return
+    matches = []
+    for channel in CHANNELS:
+        haystack = " ".join(str(value) for value in channel.values()).casefold()
+        if query_cf in haystack:
+            matches.append(channel)
+    if not matches:
+        await safe_send_text("Ничего не нашёл.", chat_id)
+        return
+    lines = []
+    for index, channel in enumerate(matches[:50], 1):
+        ref = channel.get("link") or channel.get("id")
+        label = channel.get("custom_text") or channel.get("name") or ""
+        suffix = f" | {html.escape(str(label))}" if label else ""
+        lines.append(f"{index}. {html.escape(str(ref))}{suffix}")
+    await safe_send_text("Нашёл:\n\n" + "\n".join(lines), chat_id)
+
+
 async def handle_callback(chat_id: int, callback: Any) -> None:
     data = callback.data or ""
     if data == "kw:add":
@@ -716,6 +925,37 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
         reload_keywords_from_file()
         await answer_callback(callback)
         await safe_send_text("Перезагрузил keywords.json.", chat_id)
+    elif data == "ch:add":
+        ADMIN_MODES[chat_id] = "channel_add"
+        await answer_callback(callback, "Отправьте канал")
+        await safe_send_text(
+            "Отправьте канал одним сообщением.\n\n"
+            "Открытый: @username или https://t.me/username\n"
+            "Закрытый по приглашению: https://t.me/+invite_hash\n"
+            "Закрытый уже в подписках: -1001234567890\n\n"
+            "Метка добавляется через вертикальную черту:\n"
+            "@username | РИА",
+            chat_id,
+        )
+    elif data == "ch:delete":
+        ADMIN_MODES[chat_id] = "channel_delete"
+        await answer_callback(callback, "Отправьте канал для удаления")
+        await safe_send_text("Отправьте ссылку, @username или ID канала, который нужно удалить.", chat_id)
+    elif data == "ch:label":
+        ADMIN_MODES[chat_id] = "channel_label"
+        await answer_callback(callback, "Формат: канал => метка")
+        await safe_send_text("Отправьте: ссылка_или_id => новая метка", chat_id)
+    elif data == "ch:search":
+        ADMIN_MODES[chat_id] = "channel_search"
+        await answer_callback(callback, "Отправьте строку поиска")
+        await safe_send_text("Отправьте часть ссылки, ID или метки канала.", chat_id)
+    elif data == "ch:list":
+        await answer_callback(callback)
+        await send_channel_list(chat_id)
+    elif data == "all:reload":
+        reload_keywords_from_file()
+        await safe_send_text(await reload_channels_and_refresh(), chat_id)
+        await answer_callback(callback)
 
 
 async def bot_control_loop() -> None:
