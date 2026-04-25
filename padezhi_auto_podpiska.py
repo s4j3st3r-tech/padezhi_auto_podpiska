@@ -1465,6 +1465,7 @@ def channel_list_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Проверить", callback_data="ch:check"),
             ],
             [InlineKeyboardButton("Статус всех каналов", callback_data="ch:status_all")],
+            [InlineKeyboardButton("Проверить кэшированные", callback_data="ch:check_cached")],
             [InlineKeyboardButton("Подключить недоступные", callback_data="ch:connect_unavailable")],
             [
                 InlineKeyboardButton("Метка", callback_data="ch:label"),
@@ -1676,6 +1677,41 @@ def channel_display_name(channel: dict) -> str:
     )
 
 
+def channel_status_from_cache(channel: dict) -> Tuple[str, str]:
+    if not channel.get("access_hash") or not channel.get("id"):
+        return "⚪", "нет кэша"
+    if channel.get("last_check_status") == "ok":
+        return "🟢", "доступен"
+    if channel.get("last_check_status") == "error":
+        error_text = str(channel.get("last_check_error") or "ошибка")
+        return "🔴", error_text[:80]
+    return "⚪", "не проверялся"
+
+
+def channel_status_rows(channels: List[dict]) -> List[Tuple[str, str, str]]:
+    rows = []
+    for index, channel in enumerate(channels, 1):
+        status, reason = channel_status_from_cache(channel)
+        label = f"{index}. {channel_display_name(channel)}"
+        rows.append((label, status, reason))
+    return rows
+
+
+def format_aligned_status_table(channels: List[dict], title: str = "Статус каналов") -> str:
+    if not channels:
+        return "Каналы пока пустые."
+
+    rows = channel_status_rows(channels)
+    max_label = min(max(len(label) for label, _, _ in rows), 42)
+    lines = []
+    for label, status, reason in rows:
+        short_label = label if len(label) <= max_label else label[: max_label - 1] + "…"
+        lines.append(f"{short_label:<{max_label}}  {status}  {reason}")
+
+    legend = "🟢 доступен, 🔴 ошибка, ⚪ нет кэша/не проверялся"
+    return f"{title}:\n\n<pre>{html.escape(chr(10).join(lines))}</pre>\n{legend}"
+
+
 def channel_display_url(channel: dict, entity: Any = None) -> Optional[str]:
     link = channel.get("link")
     if link and str(link).startswith(("https://t.me/", "http://t.me/", "t.me/")):
@@ -1709,6 +1745,8 @@ def format_channel_status_line(channel: dict, ok: Optional[bool] = None, entity:
 
 async def check_channel_status(channel: dict) -> Tuple[bool, Optional[Any], str]:
     try:
+        if not cached_channel_entity(channel):
+            raise ValueError("нет кэша channel_id/access_hash")
         entity = await get_channel_entity(channel)
         latest_id = 0
         async for item in client.iter_messages(entity, limit=1):
@@ -1723,69 +1761,76 @@ async def check_channel_status(channel: dict) -> Tuple[bool, Optional[Any], str]
 
 
 async def show_all_channel_statuses(chat_id: int, message_id: Optional[int] = None) -> None:
-    if not CHANNELS:
-        await show_admin_screen(chat_id, "Каналы пока пустые.", channel_list_keyboard(), message_id)
-        return
-
-    lines = ["Статус каналов:\n"]
     await show_admin_screen(
         chat_id,
-        "Статус каналов:\n\nПроверяю доступность источников...",
-        back_keyboard("ch:list"),
+        format_aligned_status_table(CHANNELS, "Статус каналов из памяти"),
+        channel_list_keyboard(),
         message_id,
     )
 
-    for index, channel in enumerate(CHANNELS, 1):
-        lines.append(f"{index}. {format_channel_status_line(channel)}")
-        await show_admin_screen(chat_id, "\n".join(lines), back_keyboard("ch:list"), message_id)
 
-        ok, entity, details = await check_channel_status(channel)
-        lines[-1] = f"{index}. {format_channel_status_line(channel, ok, entity)}"
-        await show_admin_screen(chat_id, "\n".join(lines), back_keyboard("ch:list"), message_id)
-        log.info("Статус канала %s: %s (%s)", channel, "доступен" if ok else "недоступен", details)
+async def check_cached_channels(chat_id: int, message_id: Optional[int] = None) -> None:
+    cached_channels = [channel for channel in CHANNELS if cached_channel_entity(channel)]
+    if not cached_channels:
+        await show_admin_screen(
+            chat_id,
+            "Нет кэшированных каналов для безопасной live-проверки.\n\nНажмите «Подключить недоступные», чтобы заполнить кэш осознанно.",
+            channel_list_keyboard(),
+            message_id,
+        )
+        return
+
+    await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Проверка кэшированных каналов"), back_keyboard("ch:list"), message_id)
+    for channel in cached_channels:
+        ok, _, details = await check_channel_status(channel)
+        log.info("Live-проверка кэшированного канала %s: %s (%s)", channel, "доступен" if ok else "недоступен", details)
+        refresh_memory_from_db()
+        await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Проверка кэшированных каналов"), back_keyboard("ch:list"), message_id)
         await asyncio.sleep(0.2)
 
-    lines.append("\n🟢 доступен, 🔴 недоступен")
-    await show_admin_screen(chat_id, "\n".join(lines), channel_list_keyboard(), message_id)
+    await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Проверка завершена"), channel_list_keyboard(), message_id)
 
 
 async def connect_unavailable_channels(chat_id: int, message_id: Optional[int] = None) -> None:
+    target_channels = [
+        (index, channel)
+        for index, channel in enumerate(CHANNELS, 1)
+        if channel_status_from_cache(channel)[0] != "🟢"
+    ]
     if not CHANNELS:
         await show_admin_screen(chat_id, "Каналы пока пустые.", channel_list_keyboard(), message_id)
         return
+    if not target_channels:
+        await show_admin_screen(
+            chat_id,
+            format_aligned_status_table(CHANNELS, "Все каналы уже зелёные"),
+            channel_list_keyboard(),
+            message_id,
+        )
+        return
 
-    lines = ["Подключение недоступных каналов:\n"]
-    await show_admin_screen(chat_id, "Подключение недоступных каналов:\n\nПроверяю список...", back_keyboard("ch:list"), message_id)
+    await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Подключение недоступных"), back_keyboard("ch:list"), message_id)
 
     changed = False
-    for index, channel in enumerate(CHANNELS, 1):
-        ok, entity, _ = await check_channel_status(channel)
-        if ok:
-            lines.append(f"{index}. {format_channel_status_line(channel, True, entity)} уже доступен")
-            await show_admin_screen(chat_id, "\n".join(lines), back_keyboard("ch:list"), message_id)
-            continue
-
-        lines.append(f"{index}. {format_channel_status_line(channel, None)} пробую подключить...")
-        await show_admin_screen(chat_id, "\n".join(lines), back_keyboard("ch:list"), message_id)
-
+    for index, channel in target_channels:
+        log.info("Пробую подключить недоступный канал #%s: %s", index, channel)
         joined = await join_channel(channel)
         if joined:
             changed = True
             refresh_memory_from_db()
             fresh_channel = CHANNELS[index - 1] if index - 1 < len(CHANNELS) else channel
-            ok, entity, _ = await check_channel_status(fresh_channel)
-            lines[-1] = f"{index}. {format_channel_status_line(fresh_channel, ok, entity)} {'подключен' if ok else 'добавлен, но пока не читается'}"
+            await check_channel_status(fresh_channel)
         else:
-            lines[-1] = f"{index}. {format_channel_status_line(channel, False)} не подключился"
-        await show_admin_screen(chat_id, "\n".join(lines), back_keyboard("ch:list"), message_id)
+            update_channel_cache_db(channel, status="error", error_text="не подключился")
+            refresh_memory_from_db()
+        await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Подключение недоступных"), back_keyboard("ch:list"), message_id)
         await asyncio.sleep(0.5)
 
     if changed:
         refresh_memory_from_db()
         await refresh_channel_filters()
 
-    lines.append("\nГотово. Большие FloodWait не ждём, чтобы бот не зависал.")
-    await show_admin_screen(chat_id, "\n".join(lines), channel_list_keyboard(), message_id)
+    await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Готово"), channel_list_keyboard(), message_id)
 
 
 async def show_channel_list(chat_id: int, message_id: Optional[int] = None) -> None:
@@ -2092,6 +2137,9 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
     elif data == "ch:status_all":
         ADMIN_MODES.pop(chat_id, None)
         await show_all_channel_statuses(chat_id, message_id)
+    elif data == "ch:check_cached":
+        ADMIN_MODES.pop(chat_id, None)
+        await check_cached_channels(chat_id, message_id)
     elif data == "ch:connect_unavailable":
         ADMIN_MODES.pop(chat_id, None)
         await connect_unavailable_channels(chat_id, message_id)
