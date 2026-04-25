@@ -1,0 +1,10 @@
+{
+  "api_id": 123456,
+  "api_hash": "your_api_hash",
+  "phone_number": "+79990000000",
+  "bot_token": "123456:telegram_bot_token",
+  "channel_chat_id": "-1001234567890",
+  "admin_chat_ids": [
+    123456789
+  ]
+}

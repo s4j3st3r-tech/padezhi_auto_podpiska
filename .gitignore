@@ -1,0 +1,12 @@
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+*.session
+*.session-journal
+.env
+config_telegram.json
+state.json
+dist/
+build/
+*.spec
