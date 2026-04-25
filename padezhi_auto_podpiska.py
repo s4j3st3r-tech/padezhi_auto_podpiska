@@ -142,6 +142,7 @@ ALLOWED_USERNAMES: Set[str] = set()
 ALLOWED_ID_STRINGS: Set[str] = set()
 ADMIN_MODES: Dict[int, str] = {}
 ADMIN_SCREEN_MESSAGES: Dict[int, int] = {}
+ADMIN_SCREEN_TEXTS: Dict[int, str] = {}
 BOT_UPDATE_OFFSET = 0
 BOT_SEND_LOCK = asyncio.Lock()
 
@@ -1506,6 +1507,8 @@ async def show_admin_screen(
     message_id: Optional[int] = None,
 ) -> None:
     target_message_id = message_id or ADMIN_SCREEN_MESSAGES.get(chat_id)
+    if target_message_id and ADMIN_SCREEN_TEXTS.get(chat_id) == text:
+        return
     if target_message_id:
         try:
             await bot.edit_message_text(
@@ -1517,13 +1520,18 @@ async def show_admin_screen(
                 reply_markup=reply_markup,
             )
             ADMIN_SCREEN_MESSAGES[chat_id] = target_message_id
+            ADMIN_SCREEN_TEXTS[chat_id] = text
             return
-        except Exception:
-            await delete_message_quiet(chat_id, target_message_id)
+        except Exception as exc:
+            if "Message is not modified" in str(exc):
+                ADMIN_SCREEN_TEXTS[chat_id] = text
+                return
+            log.warning("Не удалось обновить экран бота, отправлю новый: %s", exc)
 
     message = await safe_send_text(text, chat_id=chat_id, reply_markup=reply_markup)
     if message:
         ADMIN_SCREEN_MESSAGES[chat_id] = message.message_id
+        ADMIN_SCREEN_TEXTS[chat_id] = text
 
 
 async def send_admin_menu(chat_id: int, message_id: Optional[int] = None) -> None:
@@ -1702,14 +1710,15 @@ def format_aligned_status_table(channels: List[dict], title: str = "Статус
         return "Каналы пока пустые."
 
     rows = channel_status_rows(channels)
-    max_label = min(max(len(label) for label, _, _ in rows), 42)
+    max_label = min(max(len(label) for label, _, _ in rows), 34)
     lines = []
     for label, status, reason in rows:
         short_label = label if len(label) <= max_label else label[: max_label - 1] + "…"
-        lines.append(f"{short_label:<{max_label}}  {status}  {reason}")
+        dots_count = max(3, max_label - len(short_label) + 3)
+        lines.append(f"{html.escape(short_label)}{'.' * dots_count}{status} {html.escape(reason)}")
 
     legend = "🟢 доступен, 🔴 ошибка, ⚪ нет кэша/не проверялся"
-    return f"{title}:\n\n<pre>{html.escape(chr(10).join(lines))}</pre>\n{legend}"
+    return f"{html.escape(title)}:\n\n" + "\n".join(lines) + f"\n\n{legend}"
 
 
 def channel_display_url(channel: dict, entity: Any = None) -> Optional[str]:
@@ -1781,11 +1790,12 @@ async def check_cached_channels(chat_id: int, message_id: Optional[int] = None) 
         return
 
     await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Проверка кэшированных каналов"), back_keyboard("ch:list"), message_id)
-    for channel in cached_channels:
+    for index, channel in enumerate(cached_channels, 1):
         ok, _, details = await check_channel_status(channel)
         log.info("Live-проверка кэшированного канала %s: %s (%s)", channel, "доступен" if ok else "недоступен", details)
         refresh_memory_from_db()
-        await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Проверка кэшированных каналов"), back_keyboard("ch:list"), message_id)
+        if index == len(cached_channels) or index % 5 == 0:
+            await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Проверка кэшированных каналов"), back_keyboard("ch:list"), message_id)
         await asyncio.sleep(0.2)
 
     await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Проверка завершена"), channel_list_keyboard(), message_id)
@@ -1823,7 +1833,8 @@ async def connect_unavailable_channels(chat_id: int, message_id: Optional[int] =
         else:
             update_channel_cache_db(channel, status="error", error_text="не подключился")
             refresh_memory_from_db()
-        await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Подключение недоступных"), back_keyboard("ch:list"), message_id)
+        if index == target_channels[-1][0] or index % 3 == 0:
+            await show_admin_screen(chat_id, format_aligned_status_table(CHANNELS, "Подключение недоступных"), back_keyboard("ch:list"), message_id)
         await asyncio.sleep(0.5)
 
     if changed:
