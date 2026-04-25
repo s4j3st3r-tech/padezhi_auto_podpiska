@@ -468,7 +468,7 @@ def highlight_text(text: str, phrases: List[str], tokens: List[str]) -> str:
 
 
 def message_text(message: Any) -> str:
-    return getattr(message, "text", None) or getattr(message, "message", None) or ""
+    return getattr(message, "message", None) or getattr(message, "text", None) or ""
 
 
 def message_html(message: Any) -> str:
