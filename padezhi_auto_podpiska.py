@@ -1333,6 +1333,7 @@ def channel_list_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Убрать", callback_data="ch:delete"),
                 InlineKeyboardButton("Проверить", callback_data="ch:check"),
             ],
+            [InlineKeyboardButton("Статус всех каналов", callback_data="ch:status_all")],
             [
                 InlineKeyboardButton("Метка", callback_data="ch:label"),
                 InlineKeyboardButton("Найти", callback_data="ch:search"),
@@ -1531,6 +1532,87 @@ def format_channel_list(limit: int = 80) -> str:
     if len(CHANNELS) > limit:
         lines.append(f"\n...и еще {len(CHANNELS) - limit}. Используйте «Найти».")
     return "Каналы:\n\n" + "\n".join(lines)
+
+
+def channel_display_name(channel: dict) -> str:
+    return str(
+        channel.get("custom_text")
+        or channel.get("name")
+        or channel.get("link")
+        or channel.get("id")
+        or "Канал"
+    )
+
+
+def channel_display_url(channel: dict, entity: Any = None) -> Optional[str]:
+    link = channel.get("link")
+    if link and str(link).startswith(("https://t.me/", "http://t.me/", "t.me/")):
+        normalized = str(link)
+        if normalized.startswith("t.me/"):
+            normalized = f"https://{normalized}"
+        return normalized
+
+    username = getattr(entity, "username", None)
+    if username:
+        return f"https://t.me/{username}"
+
+    channel_id = channel.get("id")
+    if channel_id is not None:
+        compact_id = str(channel_id)
+        if compact_id.startswith("-100"):
+            compact_id = compact_id[4:]
+        else:
+            compact_id = compact_id.lstrip("-")
+        return f"https://t.me/c/{compact_id}"
+    return None
+
+
+def format_channel_status_line(channel: dict, ok: Optional[bool] = None, entity: Any = None) -> str:
+    status = "⏳" if ok is None else ("🟢" if ok else "🔴")
+    name = html.escape(channel_display_name(channel))
+    url = channel_display_url(channel, entity)
+    label = f'<a href="{html.escape(url, quote=True)}">{name}</a>' if url else name
+    return f"{label} {status}"
+
+
+async def check_channel_status(channel: dict) -> Tuple[bool, Optional[Any], str]:
+    try:
+        entity = await get_channel_entity(channel)
+        latest_id = 0
+        async for item in client.iter_messages(entity, limit=1):
+            latest_id = item.id
+            break
+        return True, entity, f"последний пост: {latest_id or 'нет'}"
+    except Exception as exc:
+        log.warning("Проверка статуса канала не прошла для %s: %s", channel, exc)
+        return False, None, str(exc)
+
+
+async def show_all_channel_statuses(chat_id: int, message_id: Optional[int] = None) -> None:
+    if not CHANNELS:
+        await show_admin_screen(chat_id, "Каналы пока пустые.", channel_list_keyboard(), message_id)
+        return
+
+    lines = ["Статус каналов:\n"]
+    await show_admin_screen(
+        chat_id,
+        "Статус каналов:\n\nПроверяю доступность источников...",
+        back_keyboard("ch:list"),
+        message_id,
+    )
+
+    for index, channel in enumerate(CHANNELS, 1):
+        lines.append(f"{index}. {format_channel_status_line(channel)}")
+        await show_admin_screen(chat_id, "\n".join(lines), back_keyboard("ch:list"), message_id)
+
+        ok, entity, details = await check_channel_status(channel)
+        lines[-1] = f"{index}. {format_channel_status_line(channel, ok, entity)}"
+        await show_admin_screen(chat_id, "\n".join(lines), back_keyboard("ch:list"), message_id)
+        log.info("Статус канала %s: %s (%s)", channel, "доступен" if ok else "недоступен", details)
+        await asyncio.sleep(0.2)
+
+    lines.append("\n🟢 доступен, 🔴 недоступен")
+    await show_admin_screen(chat_id, "\n".join(lines), channel_list_keyboard(), message_id)
 
 
 async def show_channel_list(chat_id: int, message_id: Optional[int] = None) -> None:
@@ -1834,6 +1916,9 @@ async def handle_callback(chat_id: int, callback: Any) -> None:
     elif data == "ch:list":
         ADMIN_MODES.pop(chat_id, None)
         await show_channel_list(chat_id, message_id)
+    elif data == "ch:status_all":
+        ADMIN_MODES.pop(chat_id, None)
+        await show_all_channel_statuses(chat_id, message_id)
     elif data == "ch:add":
         await show_admin_screen(chat_id, "Какой канал добавляем?", channel_type_keyboard(), message_id)
     elif data == "ch:add_public":
