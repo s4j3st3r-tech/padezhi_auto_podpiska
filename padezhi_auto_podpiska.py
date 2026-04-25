@@ -2,17 +2,26 @@ import asyncio
 import html
 import json
 import logging
-import os
-import re
+import sqlite3
 import sys
 import tempfile
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pymorphy2
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, error
+from telegram import (
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
+    error,
+)
 from telethon import TelegramClient, events
 from telethon.errors.rpcerrorlist import (
     FloodWaitError,
@@ -26,12 +35,6 @@ from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.utils import get_peer_id
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-log = logging.getLogger("forwarder")
-logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
-logging.getLogger("telethon.client.users").setLevel(logging.WARNING)
-
-
 def app_path() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -41,9 +44,10 @@ def app_path() -> Path:
 BASE_DIR = app_path()
 DATA_DIR = BASE_DIR / "data"
 CONFIG_PATH = BASE_DIR / "config_telegram.json"
-KEYWORDS_PATH = BASE_DIR / "keywords.json"
-CHANNELS_PATH = BASE_DIR / "channels.json"
-STATE_PATH = BASE_DIR / "state.json"
+KEYWORDS_JSON_PATH = BASE_DIR / "keywords.json"
+CHANNELS_JSON_PATH = BASE_DIR / "channels.json"
+DB_PATH = BASE_DIR / "padezhi_auto_podpiska.sqlite3"
+ERROR_LOG_PATH = BASE_DIR / "errors.log"
 
 RATE_LIMIT_DELAY = 0.8
 SEND_DELAY = 0.4
@@ -51,8 +55,19 @@ POLL_INTERVAL = 20
 POLL_LIMIT_PER_CHANNEL = 5
 PROCESSED_MAX_ITEMS = 5000
 BOT_CONTROL_INTERVAL = 1.2
+ALBUM_WAIT_SECONDS = 1.5
 
 word_re = re.compile(r"\w+", flags=re.UNICODE)
+
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+log = logging.getLogger("forwarder")
+error_handler = logging.FileHandler(ERROR_LOG_PATH, encoding="utf-8")
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
+logging.getLogger().addHandler(error_handler)
+logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
+logging.getLogger("telethon.client.users").setLevel(logging.WARNING)
 
 
 @dataclass
@@ -65,8 +80,10 @@ class AppConfig:
     admin_chat_ids: Set[int]
 
 
-def load_json(path: Path) -> Any:
+def load_json(path: Path, default: Any = None) -> Any:
     if not path.exists():
+        if default is not None:
+            return default
         raise FileNotFoundError(f"Не найден файл: {path}")
     try:
         with path.open("r", encoding="utf-8-sig") as f:
@@ -75,47 +92,25 @@ def load_json(path: Path) -> Any:
         raise ValueError(f"Файл {path.name} содержит ошибку JSON: {exc}") from exc
 
 
-def save_json(path: Path, data: Any) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-
-
 def load_config() -> AppConfig:
     raw = load_json(CONFIG_PATH)
     required = ("api_id", "api_hash", "phone_number", "bot_token", "channel_chat_id")
     missing = [name for name in required if raw.get(name) in (None, "")]
     if missing:
-        raise ValueError(
-            "Заполните поля в config_telegram.json: " + ", ".join(missing)
-        )
-
-    try:
-        api_id = int(raw["api_id"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("api_id должен быть числом") from exc
+        raise ValueError("Заполните поля в config_telegram.json: " + ", ".join(missing))
 
     admins = raw.get("admin_chat_ids") or []
-    admin_chat_ids = {int(x) for x in admins}
     return AppConfig(
-        api_id=api_id,
+        api_id=int(raw["api_id"]),
         api_hash=str(raw["api_hash"]),
         phone_number=str(raw["phone_number"]),
         bot_token=str(raw["bot_token"]),
         channel_chat_id=str(raw["channel_chat_id"]),
-        admin_chat_ids=admin_chat_ids,
+        admin_chat_ids={int(x) for x in admins},
     )
 
 
-try:
-    CONFIG = load_config()
-    RAW_KEYWORDS: List[str] = load_json(KEYWORDS_PATH)
-    CHANNELS: List[dict] = load_json(CHANNELS_PATH)
-except Exception as exc:
-    log.error("%s", exc)
-    sys.exit(1)
-
-
+CONFIG = load_config()
 morph = pymorphy2.MorphAnalyzer(path=str(DATA_DIR))
 client = TelegramClient(str(BASE_DIR / "session_name"), CONFIG.api_id, CONFIG.api_hash)
 bot = Bot(token=CONFIG.bot_token)
@@ -123,7 +118,7 @@ bot = Bot(token=CONFIG.bot_token)
 RESOLVE_CACHE: Dict[str, Any] = {}
 PROCESSED = deque(maxlen=PROCESSED_MAX_ITEMS)
 PROCESSED_LOOKUP: Set[Tuple[int, int]] = set()
-LAST_SEEN_ID: Dict[int, int] = {}
+PROCESSED_ALBUMS: Set[Tuple[int, int]] = set()
 CHANNEL_ENTITIES: Dict[str, dict] = {}
 ALLOWED_IDS: Set[int] = set()
 ALLOWED_USERNAMES: Set[str] = set()
@@ -131,9 +126,204 @@ ALLOWED_ID_STRINGS: Set[str] = set()
 ADMIN_MODES: Dict[int, str] = {}
 BOT_UPDATE_OFFSET = 0
 
+KEYWORDS: List[str] = []
+CHANNELS: List[dict] = []
 SINGLE_WORD_LEMMAS: Set[str] = set()
 PHRASES_LC: List[str] = []
-KEYWORDS: List[str] = []
+
+
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with db_connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS keywords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                link TEXT,
+                channel_id INTEGER,
+                name TEXT,
+                custom_text TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+
+def table_is_empty(table: str) -> bool:
+    with db_connect() as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+def migrate_json_to_db() -> None:
+    if table_is_empty("keywords"):
+        for keyword in load_json(KEYWORDS_JSON_PATH, []):
+            text = str(keyword or "").strip()
+            if text:
+                add_keyword_db(text)
+
+    if table_is_empty("channels"):
+        for channel in load_json(CHANNELS_JSON_PATH, []):
+            add_channel_db(channel)
+
+
+def load_keywords_from_db() -> List[str]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT text FROM keywords ORDER BY id").fetchall()
+    return [row["text"] for row in rows]
+
+
+def load_channels_from_db() -> List[dict]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT link, channel_id, name, custom_text FROM channels ORDER BY id"
+        ).fetchall()
+
+    channels = []
+    for row in rows:
+        channel = {}
+        if row["channel_id"] is not None:
+            channel["id"] = int(row["channel_id"])
+        if row["link"]:
+            channel["link"] = row["link"]
+        if row["name"]:
+            channel["name"] = row["name"]
+        if row["custom_text"]:
+            channel["custom_text"] = row["custom_text"]
+        channels.append(channel)
+    return channels
+
+
+def refresh_memory_from_db() -> None:
+    global KEYWORDS, CHANNELS
+    KEYWORDS = load_keywords_from_db()
+    CHANNELS = load_channels_from_db()
+    rebuild_keyword_index()
+
+
+def add_keyword_db(text: str) -> bool:
+    text = text.strip()
+    if not text:
+        return False
+    with db_connect() as conn:
+        cur = conn.execute("INSERT OR IGNORE INTO keywords(text) VALUES (?)", (text,))
+        return cur.rowcount > 0
+
+
+def delete_keyword_db(text: str) -> bool:
+    with db_connect() as conn:
+        cur = conn.execute("DELETE FROM keywords WHERE lower(text) = lower(?)", (text.strip(),))
+        return cur.rowcount > 0
+
+
+def rename_keyword_db(old: str, new: str) -> bool:
+    old = old.strip()
+    new = new.strip()
+    if not old or not new:
+        return False
+    with db_connect() as conn:
+        cur = conn.execute("UPDATE keywords SET text = ? WHERE lower(text) = lower(?)", (new, old))
+        return cur.rowcount > 0
+
+
+def add_channel_db(channel: dict) -> bool:
+    link = channel.get("link")
+    channel_id = channel.get("id")
+    if link and find_channel_index(str(link)) is not None:
+        return False
+    if channel_id is not None and find_channel_index(str(channel_id)) is not None:
+        return False
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO channels(link, channel_id, name, custom_text)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                str(link) if link else None,
+                int(channel_id) if channel_id is not None else None,
+                channel.get("name"),
+                channel.get("custom_text"),
+            ),
+        )
+    return True
+
+
+def delete_channel_db(reference: str) -> Optional[dict]:
+    index = find_channel_index(reference)
+    if index is None:
+        return None
+    channel = CHANNELS[index]
+    link = channel.get("link")
+    channel_id = channel.get("id")
+    with db_connect() as conn:
+        if channel_id is not None:
+            conn.execute("DELETE FROM channels WHERE channel_id = ?", (int(channel_id),))
+        else:
+            conn.execute("DELETE FROM channels WHERE lower(link) = lower(?)", (str(link),))
+    return channel
+
+
+def set_channel_label_db(reference: str, label: str) -> bool:
+    index = find_channel_index(reference)
+    if index is None:
+        return False
+    channel = CHANNELS[index]
+    with db_connect() as conn:
+        if channel.get("id") is not None:
+            cur = conn.execute(
+                "UPDATE channels SET custom_text = ? WHERE channel_id = ?",
+                (label.strip(), int(channel["id"])),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE channels SET custom_text = ? WHERE lower(link) = lower(?)",
+                (label.strip(), str(channel.get("link"))),
+            )
+    return cur.rowcount > 0
+
+
+def get_state(key: str, default: str = "0") -> str:
+    with db_connect() as conn:
+        row = conn.execute("SELECT value FROM state WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_state(key: str, value: Any) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO state(key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """,
+            (key, str(value)),
+        )
+
+
+def last_seen_key(chat_id: int) -> str:
+    return f"last_seen:{chat_id}"
+
+
+def get_last_seen(chat_id: int) -> int:
+    return int(get_state(last_seen_key(chat_id), "0"))
+
+
+def set_last_seen(chat_id: int, message_id: int) -> None:
+    set_state(last_seen_key(chat_id), message_id)
 
 
 def is_admin(chat_id: int) -> bool:
@@ -146,8 +336,7 @@ def remember_processed(key: Tuple[int, int]) -> bool:
     if key in PROCESSED_LOOKUP:
         return False
     if len(PROCESSED) == PROCESSED.maxlen and PROCESSED:
-        oldest = PROCESSED[0]
-        PROCESSED_LOOKUP.discard(oldest)
+        PROCESSED_LOOKUP.discard(PROCESSED[0])
     PROCESSED.append(key)
     PROCESSED_LOOKUP.add(key)
     return True
@@ -161,73 +350,37 @@ def rebuild_keyword_index() -> None:
     SINGLE_WORD_LEMMAS.clear()
     PHRASES_LC.clear()
     seen = set()
-    KEYWORDS.clear()
-
-    for item in RAW_KEYWORDS:
-        keyword = str(item or "").strip()
-        if not keyword:
+    for keyword in KEYWORDS:
+        text = str(keyword or "").strip()
+        if not text:
             continue
-        key = keyword.casefold()
+        key = text.casefold()
         if key in seen:
             continue
         seen.add(key)
-        KEYWORDS.append(keyword)
-        parts = word_re.findall(keyword)
+        parts = word_re.findall(text)
         if len(parts) <= 1:
-            SINGLE_WORD_LEMMAS.add(lemma(keyword.lower()))
+            SINGLE_WORD_LEMMAS.add(lemma(text.lower()))
         else:
-            PHRASES_LC.append(keyword.lower())
-
-
-def save_keywords() -> None:
-    save_json(KEYWORDS_PATH, KEYWORDS)
-
-
-def save_channels() -> None:
-    save_json(CHANNELS_PATH, CHANNELS)
+            PHRASES_LC.append(text.lower())
 
 
 def add_keyword(keyword: str) -> bool:
-    keyword = keyword.strip()
-    if not keyword:
-        return False
-    existing = {k.casefold() for k in KEYWORDS}
-    if keyword.casefold() in existing:
-        return False
-    RAW_KEYWORDS.append(keyword)
-    rebuild_keyword_index()
-    save_keywords()
-    return True
+    added = add_keyword_db(keyword)
+    refresh_memory_from_db()
+    return added
 
 
 def delete_keyword(keyword: str) -> bool:
-    keyword_cf = keyword.strip().casefold()
-    if not keyword_cf:
-        return False
-    before = len(RAW_KEYWORDS)
-    RAW_KEYWORDS[:] = [k for k in RAW_KEYWORDS if str(k).strip().casefold() != keyword_cf]
-    changed = len(RAW_KEYWORDS) != before
-    if changed:
-        rebuild_keyword_index()
-        save_keywords()
-    return changed
+    deleted = delete_keyword_db(keyword)
+    refresh_memory_from_db()
+    return deleted
 
 
 def rename_keyword(old: str, new: str) -> bool:
-    old_cf = old.strip().casefold()
-    new = new.strip()
-    if not old_cf or not new:
-        return False
-    changed = False
-    for index, value in enumerate(RAW_KEYWORDS):
-        if str(value).strip().casefold() == old_cf:
-            RAW_KEYWORDS[index] = new
-            changed = True
-            break
-    if changed:
-        rebuild_keyword_index()
-        save_keywords()
-    return changed
+    renamed = rename_keyword_db(old, new)
+    refresh_memory_from_db()
+    return renamed
 
 
 def normalize_text(text: str) -> List[Tuple[str, str]]:
@@ -269,6 +422,10 @@ def highlight_text(text: str, phrases: List[str], tokens: List[str]) -> str:
     return escaped
 
 
+def message_text(message: Any) -> str:
+    return getattr(message, "text", None) or getattr(message, "message", None) or ""
+
+
 def message_link_for(chat: Any, message_id: int) -> str:
     username = getattr(chat, "username", None)
     if username:
@@ -288,18 +445,17 @@ def get_channel_custom_text(chat: Any) -> str:
     return ""
 
 
-def format_forward_text(chat: Any, message: Any, triggers: List[str]) -> str:
-    phrases, words = find_triggers(message.text or "")
-    highlighted = highlight_text(message.text or "", phrases, words)
+def format_forward_text(chat: Any, message: Any, triggers: List[str], source_text: str) -> str:
+    phrases, words = find_triggers(source_text)
+    highlighted = highlight_text(source_text, phrases, words)
     message_link = message_link_for(chat, message.id)
     title = html.escape(getattr(chat, "title", "Источник"))
     custom_text = html.escape(get_channel_custom_text(chat))
-
-    if custom_text:
-        header = f'Найден пост в {custom_text} <a href="{message_link}">{title}</a>'
-    else:
-        header = f'Найден пост в <a href="{message_link}">{title}</a>'
-
+    header = (
+        f'Найден пост в {custom_text} <a href="{message_link}">{title}</a>'
+        if custom_text
+        else f'Найден пост в <a href="{message_link}">{title}</a>'
+    )
     tail = ""
     if triggers:
         safe_triggers = [html.escape(item) for item in sorted(set(triggers))]
@@ -329,62 +485,65 @@ async def resolve_link_once(link: str):
     return entity
 
 
-async def join_channel(channel: dict) -> bool:
+async def get_channel_entity(channel: dict):
     if "id" in channel:
-        try:
-            entity = await client.get_input_entity(channel["id"])
-            await asyncio.sleep(0.2)
-            await client(JoinChannelRequest(entity))
-            log.info("Подписались на канал ID %s", channel["id"])
-        except UserAlreadyParticipantError:
-            log.info("Уже подписаны на канал ID %s", channel["id"])
-        except Exception as exc:
-            log.error("Не удалось подключить канал ID %s: %s", channel["id"], exc)
-            return False
-        return True
-
+        return await client.get_input_entity(channel["id"])
     link = channel.get("link", "")
+    if "joinchat" in link or "t.me/+" in link:
+        return await resolve_link_once(link)
+    username = link.rsplit("/", 1)[-1].lstrip("@")
+    return await resolve_username_once(username)
+
+
+async def join_channel(channel: dict) -> bool:
     try:
+        if "id" in channel:
+            entity = await client.get_input_entity(channel["id"])
+            await client(JoinChannelRequest(entity))
+            return True
+
+        link = channel.get("link", "")
         if "joinchat" in link or "t.me/+" in link:
             invite_hash = link.split("/")[-1].replace("+", "")
-            try:
-                await asyncio.sleep(0.2)
-                await client(ImportChatInviteRequest(invite_hash))
-                log.info("Подписались по инвайт-ссылке: %s", link)
-                return True
-            except FloodWaitError as exc:
-                log.warning("FloodWait %ss для %s", exc.seconds, link)
-                await asyncio.sleep(exc.seconds)
-                await client(ImportChatInviteRequest(invite_hash))
-                return True
-            except (InviteHashExpiredError, InviteHashInvalidError) as exc:
-                log.error("Проблема с инвайт-ссылкой %s: %s", link, exc)
-                return False
-            except UserAlreadyParticipantError:
-                log.info("Уже подписаны: %s", link)
-                return True
+            await client(ImportChatInviteRequest(invite_hash))
+            return True
 
-        username = link.rsplit("/", 1)[-1].lstrip("@")
-        entity = await resolve_username_once(username)
-        try:
-            await asyncio.sleep(0.2)
-            await client(JoinChannelRequest(entity))
-            log.info("Подписались на канал: %s", link)
-        except UserAlreadyParticipantError:
-            log.info("Уже подписаны: %s", link)
-        except Exception as exc:
-            log.error("Не удалось подписаться на %s: %s", link, exc)
-            return False
+        entity = await get_channel_entity(channel)
+        await client(JoinChannelRequest(entity))
         return True
-    except Exception as exc:
-        log.error("Не удалось обработать канал %s: %s", link, exc)
+    except UserAlreadyParticipantError:
+        return True
+    except FloodWaitError as exc:
+        log.warning("FloodWait %ss для канала %s", exc.seconds, channel)
+        await asyncio.sleep(exc.seconds)
+        return await join_channel(channel)
+    except (InviteHashExpiredError, InviteHashInvalidError) as exc:
+        log.error("Проблема с invite-ссылкой %s: %s", channel, exc)
         return False
+    except Exception as exc:
+        log.error("Не удалось подключить канал %s: %s", channel, exc)
+        return False
+
+
+async def check_channel_access(reference: str) -> str:
+    try:
+        channel = parse_channel_input(reference)
+        entity = await get_channel_entity(channel)
+        peer_id = get_peer_id(entity)
+        title = html.escape(getattr(entity, "title", getattr(entity, "username", "канал")))
+        latest_id = 0
+        async for message in client.iter_messages(entity, limit=1):
+            latest_id = message.id
+            break
+        return f"Канал доступен: {title}\nID: {peer_id}\nПоследний пост: {latest_id or 'нет'}"
+    except Exception as exc:
+        log.error("Проверка канала не прошла для %s: %s", reference, exc)
+        return f"Канал недоступен: {html.escape(str(exc))}"
 
 
 async def safe_send_text(text: str, chat_id: Optional[int] = None, reply_markup=None) -> None:
     target = chat_id if chat_id is not None else CONFIG.channel_chat_id
-    attempts = 0
-    while True:
+    for attempt in range(3):
         try:
             await asyncio.sleep(SEND_DELAY)
             await bot.send_message(
@@ -395,64 +554,10 @@ async def safe_send_text(text: str, chat_id: Optional[int] = None, reply_markup=
                 reply_markup=reply_markup,
             )
             return
-        except (error.TimedOut, asyncio.TimeoutError) as exc:
-            attempts += 1
-            if attempts >= 3:
-                log.error("Сообщение не отправилось после повторов: %s", exc)
-                return
-            await asyncio.sleep(2**attempts)
-        except error.BadRequest as exc:
+        except (error.TimedOut, asyncio.TimeoutError):
+            await asyncio.sleep(2**attempt)
+        except Exception as exc:
             log.error("Ошибка отправки сообщения: %s", exc)
-            return
-        except Exception as exc:
-            log.error("Непредвиденная ошибка отправки: %s", exc)
-            return
-
-
-async def safe_send_media(text: str, media_path: Path, media_kind: str) -> None:
-    attempts = 0
-    caption = text if len(text) <= 1000 else "Найден пост с медиа. Текст отправлен отдельным сообщением."
-    while True:
-        try:
-            await asyncio.sleep(SEND_DELAY)
-            with media_path.open("rb") as media:
-                if media_kind == "photo":
-                    await bot.send_photo(
-                        chat_id=CONFIG.channel_chat_id,
-                        photo=media,
-                        caption=caption,
-                        parse_mode="HTML",
-                    )
-                elif media_kind == "video":
-                    await bot.send_video(
-                        chat_id=CONFIG.channel_chat_id,
-                        video=media,
-                        caption=caption,
-                        parse_mode="HTML",
-                    )
-                else:
-                    await bot.send_document(
-                        chat_id=CONFIG.channel_chat_id,
-                        document=media,
-                        caption=caption,
-                        parse_mode="HTML",
-                    )
-            if len(text) > 1024:
-                await safe_send_text(text)
-            return
-        except (error.TimedOut, asyncio.TimeoutError) as exc:
-            attempts += 1
-            if attempts >= 3:
-                log.error("Медиа не отправилось после повторов: %s", exc)
-                return
-            await asyncio.sleep(2**attempts)
-        except error.BadRequest as exc:
-            log.error("Ошибка отправки медиа: %s", exc)
-            await safe_send_text(text)
-            return
-        except Exception as exc:
-            log.error("Непредвиденная ошибка отправки медиа: %s", exc)
-            await safe_send_text(text)
             return
 
 
@@ -468,42 +573,132 @@ def media_kind_for(message: Any) -> Optional[str]:
     return "document"
 
 
-async def forward_to_target(chat: Any, message: Any, text: str) -> None:
+async def safe_send_media(text: str, media_path: Path, media_kind: str) -> None:
+    caption = text if len(text) <= 1000 else "Найден пост с медиа. Текст отправлен отдельным сообщением."
+    try:
+        with media_path.open("rb") as media:
+            if media_kind == "photo":
+                await bot.send_photo(CONFIG.channel_chat_id, media, caption=caption, parse_mode="HTML")
+            elif media_kind == "video":
+                await bot.send_video(CONFIG.channel_chat_id, media, caption=caption, parse_mode="HTML")
+            else:
+                await bot.send_document(CONFIG.channel_chat_id, media, caption=caption, parse_mode="HTML")
+        if len(text) > 1000:
+            await safe_send_text(text)
+    except Exception as exc:
+        log.error("Ошибка отправки медиа: %s", exc)
+        await safe_send_text(text)
+
+
+async def send_album_to_target(text: str, messages: List[Any]) -> None:
+    media_messages = [message for message in messages if media_kind_for(message)]
+    if not media_messages:
+        await safe_send_text(text)
+        return
+
+    caption = text if len(text) <= 1000 else "Найден альбом. Текст отправлен отдельным сообщением."
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = []
+            for message in media_messages[:10]:
+                downloaded = await client.download_media(message, file=temp_dir)
+                if downloaded:
+                    paths.append((Path(downloaded), media_kind_for(message)))
+
+            if not paths:
+                await safe_send_text(text)
+                return
+
+            if len(paths) == 1:
+                await safe_send_media(text, paths[0][0], paths[0][1] or "document")
+                return
+
+            handles = []
+            media_group = []
+            try:
+                for index, (path, kind) in enumerate(paths):
+                    handle = path.open("rb")
+                    handles.append(handle)
+                    media_caption = caption if index == 0 else None
+                    if kind == "photo":
+                        media_group.append(InputMediaPhoto(handle, caption=media_caption, parse_mode="HTML"))
+                    elif kind == "video":
+                        media_group.append(InputMediaVideo(handle, caption=media_caption, parse_mode="HTML"))
+                    else:
+                        media_group.append(InputMediaDocument(handle, caption=media_caption, parse_mode="HTML"))
+
+                await bot.send_media_group(CONFIG.channel_chat_id, media_group)
+                if len(text) > 1000:
+                    await safe_send_text(text)
+            finally:
+                for handle in handles:
+                    handle.close()
+    except Exception as exc:
+        log.error("Ошибка отправки альбома: %s", exc)
+        await safe_send_text(text)
+
+
+async def forward_to_target(chat: Any, message: Any, text: str, album_messages: Optional[List[Any]] = None) -> None:
+    if album_messages:
+        await send_album_to_target(text, album_messages)
+        return
+
     kind = media_kind_for(message)
     if not kind:
         await safe_send_text(text)
         return
 
-    temp_path = None
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             downloaded = await client.download_media(message, file=temp_dir)
-            if not downloaded:
+            if downloaded:
+                await safe_send_media(text, Path(downloaded), kind)
+            else:
                 await safe_send_text(text)
-                return
-            temp_path = Path(downloaded)
-            await safe_send_media(text, temp_path, kind)
     except Exception as exc:
-        log.error("Не удалось переслать медиа, отправляю только текст: %s", exc)
+        log.error("Не удалось переслать медиа: %s", exc)
         await safe_send_text(text)
 
 
-async def process_and_maybe_forward(chat: Any, message: Any) -> None:
+async def collect_album_messages(entity: Any, grouped_id: int) -> List[Any]:
+    await asyncio.sleep(ALBUM_WAIT_SECONDS)
+    messages = []
+    async for item in client.iter_messages(entity, limit=20):
+        if getattr(item, "grouped_id", None) == grouped_id:
+            messages.append(item)
+    return sorted(messages, key=lambda item: item.id)
+
+
+async def process_and_maybe_forward(chat: Any, message: Any, entity: Any = None) -> None:
     if not message:
         return
-    key = (message.chat_id, message.id)
-    if not remember_processed(key):
-        return
-    if not getattr(message, "text", None):
+
+    grouped_id = getattr(message, "grouped_id", None)
+    if grouped_id:
+        album_key = (message.chat_id, int(grouped_id))
+        if album_key in PROCESSED_ALBUMS:
+            return
+        PROCESSED_ALBUMS.add(album_key)
+        album_messages = await collect_album_messages(entity or chat, grouped_id)
+        for album_message in album_messages:
+            remember_processed((album_message.chat_id, album_message.id))
+        source_text = "\n\n".join(message_text(item) for item in album_messages if message_text(item)).strip()
+    else:
+        if not remember_processed((message.chat_id, message.id)):
+            return
+        album_messages = None
+        source_text = message_text(message).strip()
+
+    if not source_text:
         return
 
-    should, triggers = should_forward(message.text)
-    log.info("Текст: %r | найдено ключей: %s", message.text, triggers)
+    should, triggers = should_forward(source_text)
+    log.info("Найдено ключей: %s", triggers)
     if not should:
         return
 
-    text = format_forward_text(chat, message, triggers)
-    await forward_to_target(chat, message, text)
+    text = format_forward_text(chat, message, triggers, source_text)
+    await forward_to_target(chat, message, text, album_messages)
 
 
 async def keep_updates_alive() -> None:
@@ -515,46 +710,28 @@ async def keep_updates_alive() -> None:
         await asyncio.sleep(20)
 
 
-def load_state() -> None:
-    global LAST_SEEN_ID
-    if not STATE_PATH.exists():
-        return
-    try:
-        raw = load_json(STATE_PATH)
-        LAST_SEEN_ID = {int(k): int(v) for k, v in raw.get("last_seen_id", {}).items()}
-    except Exception as exc:
-        log.warning("Не удалось загрузить state.json: %s", exc)
-
-
-def save_state() -> None:
-    save_json(STATE_PATH, {"last_seen_id": {str(k): v for k, v in LAST_SEEN_ID.items()}})
-
-
 async def polling_loop() -> None:
     while True:
         try:
             for info in CHANNEL_ENTITIES.values():
                 entity = info["entity"]
                 chat_id = get_peer_id(entity)
-                last_id = LAST_SEEN_ID.get(chat_id, 0)
-                new_msgs = []
-
+                last_id = get_last_seen(chat_id)
+                new_messages = []
                 async for message in client.iter_messages(entity, limit=POLL_LIMIT_PER_CHANNEL):
                     if last_id and message.id <= last_id:
                         break
-                    new_msgs.append(message)
+                    new_messages.append(message)
 
-                for message in reversed(new_msgs):
+                for message in reversed(new_messages):
                     chat = await message.get_chat()
-                    await process_and_maybe_forward(chat, message)
-                    LAST_SEEN_ID[chat_id] = max(LAST_SEEN_ID.get(chat_id, 0), message.id)
-                    save_state()
+                    await process_and_maybe_forward(chat, message, entity)
+                    set_last_seen(chat_id, max(get_last_seen(chat_id), message.id))
                     await asyncio.sleep(0.1)
 
                 await asyncio.sleep(0.1)
         except Exception as exc:
-            log.warning("polling_loop: %s", exc)
-
+            log.error("polling_loop: %s", exc)
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -570,19 +747,22 @@ def admin_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Ключ найти", callback_data="kw:search"),
             ],
             [
-                InlineKeyboardButton("Ключи список", callback_data="kw:list"),
-                InlineKeyboardButton("Статус", callback_data="kw:stats"),
+                InlineKeyboardButton("Каналы список", callback_data="ch:list"),
+                InlineKeyboardButton("Канал +", callback_data="ch:add"),
             ],
             [
-                InlineKeyboardButton("Канал +", callback_data="ch:add"),
                 InlineKeyboardButton("Канал -", callback_data="ch:delete"),
+                InlineKeyboardButton("Канал проверить", callback_data="ch:check"),
             ],
             [
                 InlineKeyboardButton("Канал метка", callback_data="ch:label"),
                 InlineKeyboardButton("Канал найти", callback_data="ch:search"),
             ],
             [
-                InlineKeyboardButton("Каналы список", callback_data="ch:list"),
+                InlineKeyboardButton("Статус", callback_data="kw:stats"),
+                InlineKeyboardButton("Ошибки", callback_data="errors:last"),
+            ],
+            [
                 InlineKeyboardButton("Перезагрузить", callback_data="all:reload"),
             ],
         ]
@@ -591,21 +771,10 @@ def admin_keyboard() -> InlineKeyboardMarkup:
 
 async def send_admin_menu(chat_id: int) -> None:
     await safe_send_text(
-        "Панель управления ключевыми словами.\n\n"
-        "Можно пользоваться кнопками или командами:\n"
-        "/add слово\n"
-        "/del слово\n"
-        "/rename старое => новое\n"
-        "/search часть_слова\n"
-        "/list\n"
-        "/stats\n\n"
-        "Каналы:\n"
-        "/ch_add @username | метка\n"
-        "/ch_add https://t.me/+invite_hash | метка\n"
-        "/ch_add -1001234567890 | метка\n"
-        "/ch_del ссылка_или_id\n"
-        "/ch_label ссылка_или_id => новая метка\n"
-        "/ch_list",
+        "Панель управления.\n\n"
+        "Ключи: /add, /del, /rename, /search, /list\n"
+        "Каналы: /ch_add, /ch_del, /ch_label, /ch_check, /ch_list\n"
+        "Диагностика: /stats, /errors",
         chat_id=chat_id,
         reply_markup=admin_keyboard(),
     )
@@ -618,96 +787,19 @@ async def answer_callback(callback: Any, text: str = "Готово") -> None:
         pass
 
 
-async def handle_admin_text(chat_id: int, text: str) -> None:
-    text = text.strip()
-    mode = ADMIN_MODES.pop(chat_id, "")
-
-    if mode == "add":
-        added = add_keyword(text)
-        await safe_send_text("Добавил." if added else "Такой ключ уже есть или текст пустой.", chat_id)
-        return
-    if mode == "delete":
-        deleted = delete_keyword(text)
-        await safe_send_text("Удалил." if deleted else "Не нашёл такой ключ.", chat_id)
-        return
-    if mode == "rename":
-        if "=>" not in text:
-            await safe_send_text("Формат: старое => новое", chat_id)
-            return
-        old, new = [part.strip() for part in text.split("=>", 1)]
-        renamed = rename_keyword(old, new)
-        await safe_send_text("Изменил." if renamed else "Не нашёл старый ключ.", chat_id)
-        return
-    if mode == "search":
-        await send_keyword_search(chat_id, text)
-        return
-    if mode == "channel_add":
-        await safe_send_text(await add_channel_and_refresh(text), chat_id)
-        return
-    if mode == "channel_delete":
-        await safe_send_text(await delete_channel_and_refresh(text), chat_id)
-        return
-    if mode == "channel_label":
-        await safe_send_text(await set_channel_label_and_refresh(text), chat_id)
-        return
-    if mode == "channel_search":
-        await send_channel_search(chat_id, text)
-        return
-
-    if text.startswith("/start") or text.startswith("/menu"):
-        await send_admin_menu(chat_id)
-    elif text.startswith("/add "):
-        added = add_keyword(text[5:])
-        await safe_send_text("Добавил." if added else "Такой ключ уже есть или текст пустой.", chat_id)
-    elif text.startswith("/del "):
-        deleted = delete_keyword(text[5:])
-        await safe_send_text("Удалил." if deleted else "Не нашёл такой ключ.", chat_id)
-    elif text.startswith("/rename "):
-        payload = text[8:].strip()
-        if "=>" not in payload:
-            await safe_send_text("Формат: /rename старое => новое", chat_id)
-            return
-        old, new = [part.strip() for part in payload.split("=>", 1)]
-        renamed = rename_keyword(old, new)
-        await safe_send_text("Изменил." if renamed else "Не нашёл старый ключ.", chat_id)
-    elif text.startswith("/search "):
-        await send_keyword_search(chat_id, text[8:])
-    elif text.startswith("/list"):
-        await send_keyword_list(chat_id)
-    elif text.startswith("/stats"):
-        await send_stats(chat_id)
-    elif text.startswith("/reload"):
-        reload_keywords_from_file()
-        await safe_send_text("Перезагрузил keywords.json.", chat_id)
-    elif text.startswith("/ch_add "):
-        await safe_send_text(await add_channel_and_refresh(text[8:]), chat_id)
-    elif text.startswith("/ch_del "):
-        await safe_send_text(await delete_channel_and_refresh(text[8:]), chat_id)
-    elif text.startswith("/ch_label "):
-        await safe_send_text(await set_channel_label_and_refresh(text[10:]), chat_id)
-    elif text.startswith("/ch_search "):
-        await send_channel_search(chat_id, text[11:])
-    elif text.startswith("/ch_list"):
-        await send_channel_list(chat_id)
-    elif text.startswith("/ch_reload"):
-        await safe_send_text(await reload_channels_and_refresh(), chat_id)
-    else:
-        await send_admin_menu(chat_id)
-
-
 async def send_keyword_list(chat_id: int) -> None:
     lines = [f"{index + 1}. {html.escape(value)}" for index, value in enumerate(KEYWORDS)]
-    text = "Ключевые слова:\n\n" + "\n".join(lines)
-    for start in range(0, len(text), 3500):
-        await safe_send_text(text[start : start + 3500], chat_id)
+    await send_long_text(chat_id, "Ключевые слова:\n\n" + "\n".join(lines))
+
+
+async def send_long_text(chat_id: int, text: str) -> None:
+    for start in range(0, max(len(text), 1), 3500):
+        await safe_send_text(text[start : start + 3500] or "Пусто.", chat_id)
 
 
 async def send_keyword_search(chat_id: int, query: str) -> None:
     query_cf = query.strip().casefold()
-    if not query_cf:
-        await safe_send_text("Введите часть ключа для поиска.", chat_id)
-        return
-    matches = [item for item in KEYWORDS if query_cf in item.casefold()]
+    matches = [item for item in KEYWORDS if query_cf in item.casefold()] if query_cf else []
     if not matches:
         await safe_send_text("Ничего не нашёл.", chat_id)
         return
@@ -719,17 +811,14 @@ async def send_stats(chat_id: int) -> None:
     await safe_send_text(
         "Статус:\n"
         f"Ключей: {len(KEYWORDS)}\n"
-        f"Каналов: {len(CHANNEL_ENTITIES) or len(CHANNELS)}\n"
+        f"Каналов в базе: {len(CHANNELS)}\n"
+        f"Каналов подключено: {len(CHANNEL_ENTITIES)}\n"
         f"Однословных лемм: {len(SINGLE_WORD_LEMMAS)}\n"
         f"Фраз: {len(PHRASES_LC)}\n"
-        f"Обработано в памяти: {len(PROCESSED_LOOKUP)}",
+        f"Обработано в памяти: {len(PROCESSED_LOOKUP)}\n"
+        f"База: {html.escape(str(DB_PATH.name))}",
         chat_id,
     )
-
-
-def reload_keywords_from_file() -> None:
-    RAW_KEYWORDS[:] = load_json(KEYWORDS_PATH)
-    rebuild_keyword_index()
 
 
 def parse_channel_input(text: str) -> dict:
@@ -787,80 +876,49 @@ def find_channel_index(reference: str) -> Optional[int]:
     return None
 
 
-def add_channel_config(text: str) -> Tuple[bool, str, Optional[dict]]:
-    try:
-        channel = parse_channel_input(text)
-    except ValueError as exc:
-        return False, str(exc), None
-
-    if find_channel_index(str(channel.get("id") or channel.get("link"))) is not None:
-        return False, "Такой канал уже есть в channels.json.", None
-
-    CHANNELS.append(channel)
-    save_channels()
-    return True, "Канал добавлен.", channel
-
-
-def delete_channel_config(reference: str) -> Tuple[bool, str]:
-    index = find_channel_index(reference)
-    if index is None:
-        return False, "Не нашёл такой канал."
-    removed = CHANNELS.pop(index)
-    save_channels()
-    return True, f"Удалил: {html.escape(str(removed.get('link') or removed.get('id')))}"
-
-
-def set_channel_label(reference: str, label: str) -> Tuple[bool, str]:
-    index = find_channel_index(reference)
-    if index is None:
-        return False, "Не нашёл такой канал."
-    CHANNELS[index]["custom_text"] = label.strip()
-    save_channels()
-    return True, "Метка канала обновлена."
-
-
 async def refresh_channel_filters() -> None:
     global CHANNEL_ENTITIES, ALLOWED_IDS, ALLOWED_USERNAMES, ALLOWED_ID_STRINGS
     CHANNEL_ENTITIES, ALLOWED_IDS, ALLOWED_USERNAMES, ALLOWED_ID_STRINGS = await build_filters()
 
 
 async def add_channel_and_refresh(text: str) -> str:
-    added, message, channel = add_channel_config(text)
-    if not added or not channel:
-        return message
-
+    try:
+        channel = parse_channel_input(text)
+    except ValueError as exc:
+        return str(exc)
+    if not add_channel_db(channel):
+        return "Такой канал уже есть."
+    refresh_memory_from_db()
     joined = await join_channel(channel)
     await refresh_channel_filters()
-    if joined:
-        return "Канал добавлен и подключён."
-    return "Канал сохранён, но подключиться сразу не удалось. Проверьте ссылку/ID и подписку аккаунта."
+    return "Канал добавлен и подключён." if joined else "Канал сохранён, но пока недоступен."
 
 
 async def delete_channel_and_refresh(reference: str) -> str:
-    ok, message = delete_channel_config(reference)
-    if ok:
+    removed = delete_channel_db(reference)
+    refresh_memory_from_db()
+    if removed:
         await refresh_channel_filters()
-    return message
+        return f"Удалил: {html.escape(str(removed.get('link') or removed.get('id')))}"
+    return "Не нашёл такой канал."
 
 
 async def set_channel_label_and_refresh(payload: str) -> str:
     if "=>" not in payload:
         return "Формат: канал => новая метка"
     reference, label = [part.strip() for part in payload.split("=>", 1)]
-    ok, message = set_channel_label(reference, label)
+    ok = set_channel_label_db(reference, label)
+    refresh_memory_from_db()
     if ok:
         await refresh_channel_filters()
-    return message
+        return "Метка канала обновлена."
+    return "Не нашёл такой канал."
 
 
-def reload_channels_from_file() -> None:
-    CHANNELS[:] = load_json(CHANNELS_PATH)
-
-
-async def reload_channels_and_refresh() -> str:
-    reload_channels_from_file()
+async def reload_all_from_db() -> str:
+    refresh_memory_from_db()
     await refresh_channel_filters()
-    return "Перезагрузил channels.json."
+    return "Перезагрузил данные из SQLite."
 
 
 async def send_channel_list(chat_id: int) -> None:
@@ -870,20 +928,15 @@ async def send_channel_list(chat_id: int) -> None:
         label = channel.get("custom_text") or channel.get("name") or ""
         suffix = f" | {html.escape(str(label))}" if label else ""
         lines.append(f"{index}. {html.escape(str(ref))}{suffix}")
-    text = "Каналы:\n\n" + "\n".join(lines)
-    for start in range(0, len(text), 3500):
-        await safe_send_text(text[start : start + 3500], chat_id)
+    await send_long_text(chat_id, "Каналы:\n\n" + "\n".join(lines))
 
 
 async def send_channel_search(chat_id: int, query: str) -> None:
     query_cf = query.strip().casefold()
-    if not query_cf:
-        await safe_send_text("Введите часть ссылки, ID или метки канала.", chat_id)
-        return
     matches = []
     for channel in CHANNELS:
         haystack = " ".join(str(value) for value in channel.values()).casefold()
-        if query_cf in haystack:
+        if query_cf and query_cf in haystack:
             matches.append(channel)
     if not matches:
         await safe_send_text("Ничего не нашёл.", chat_id)
@@ -897,65 +950,125 @@ async def send_channel_search(chat_id: int, query: str) -> None:
     await safe_send_text("Нашёл:\n\n" + "\n".join(lines), chat_id)
 
 
+async def send_errors(chat_id: int) -> None:
+    if not ERROR_LOG_PATH.exists():
+        await safe_send_text("Файл ошибок пока пуст.", chat_id)
+        return
+    lines = ERROR_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+    await send_long_text(chat_id, "Последние ошибки:\n\n" + html.escape("\n".join(lines) or "Ошибок нет."))
+
+
+async def handle_admin_text(chat_id: int, text: str) -> None:
+    text = text.strip()
+    mode = ADMIN_MODES.pop(chat_id, "")
+
+    if mode == "add":
+        await safe_send_text("Добавил." if add_keyword(text) else "Такой ключ уже есть или текст пустой.", chat_id)
+    elif mode == "delete":
+        await safe_send_text("Удалил." if delete_keyword(text) else "Не нашёл такой ключ.", chat_id)
+    elif mode == "rename":
+        if "=>" not in text:
+            await safe_send_text("Формат: старое => новое", chat_id)
+            return
+        old, new = [part.strip() for part in text.split("=>", 1)]
+        await safe_send_text("Изменил." if rename_keyword(old, new) else "Не нашёл старый ключ.", chat_id)
+    elif mode == "search":
+        await send_keyword_search(chat_id, text)
+    elif mode == "channel_add":
+        await safe_send_text(await add_channel_and_refresh(text), chat_id)
+    elif mode == "channel_delete":
+        await safe_send_text(await delete_channel_and_refresh(text), chat_id)
+    elif mode == "channel_label":
+        await safe_send_text(await set_channel_label_and_refresh(text), chat_id)
+    elif mode == "channel_search":
+        await send_channel_search(chat_id, text)
+    elif mode == "channel_check":
+        await safe_send_text(await check_channel_access(text), chat_id)
+    elif text.startswith("/start") or text.startswith("/menu"):
+        await send_admin_menu(chat_id)
+    elif text.startswith("/add "):
+        await safe_send_text("Добавил." if add_keyword(text[5:]) else "Такой ключ уже есть или текст пустой.", chat_id)
+    elif text.startswith("/del "):
+        await safe_send_text("Удалил." if delete_keyword(text[5:]) else "Не нашёл такой ключ.", chat_id)
+    elif text.startswith("/rename "):
+        payload = text[8:].strip()
+        if "=>" not in payload:
+            await safe_send_text("Формат: /rename старое => новое", chat_id)
+            return
+        old, new = [part.strip() for part in payload.split("=>", 1)]
+        await safe_send_text("Изменил." if rename_keyword(old, new) else "Не нашёл старый ключ.", chat_id)
+    elif text.startswith("/search "):
+        await send_keyword_search(chat_id, text[8:])
+    elif text.startswith("/list"):
+        await send_keyword_list(chat_id)
+    elif text.startswith("/stats"):
+        await send_stats(chat_id)
+    elif text.startswith("/errors"):
+        await send_errors(chat_id)
+    elif text.startswith("/ch_add "):
+        await safe_send_text(await add_channel_and_refresh(text[8:]), chat_id)
+    elif text.startswith("/ch_del "):
+        await safe_send_text(await delete_channel_and_refresh(text[8:]), chat_id)
+    elif text.startswith("/ch_label "):
+        await safe_send_text(await set_channel_label_and_refresh(text[10:]), chat_id)
+    elif text.startswith("/ch_check "):
+        await safe_send_text(await check_channel_access(text[10:]), chat_id)
+    elif text.startswith("/ch_search "):
+        await send_channel_search(chat_id, text[11:])
+    elif text.startswith("/ch_list"):
+        await send_channel_list(chat_id)
+    elif text.startswith("/reload") or text.startswith("/ch_reload"):
+        await safe_send_text(await reload_all_from_db(), chat_id)
+    else:
+        await send_admin_menu(chat_id)
+
+
 async def handle_callback(chat_id: int, callback: Any) -> None:
     data = callback.data or ""
     if data == "kw:add":
         ADMIN_MODES[chat_id] = "add"
-        await answer_callback(callback, "Отправьте новый ключ")
-        await safe_send_text("Отправьте ключевое слово или фразу одним сообщением.", chat_id)
+        await safe_send_text("Отправьте ключевое слово или фразу.", chat_id)
     elif data == "kw:delete":
         ADMIN_MODES[chat_id] = "delete"
-        await answer_callback(callback, "Отправьте ключ для удаления")
-        await safe_send_text("Отправьте точный ключ, который нужно удалить.", chat_id)
+        await safe_send_text("Отправьте точный ключ для удаления.", chat_id)
     elif data == "kw:rename":
         ADMIN_MODES[chat_id] = "rename"
-        await answer_callback(callback, "Формат: старое => новое")
-        await safe_send_text("Отправьте изменение в формате: старое => новое", chat_id)
+        await safe_send_text("Формат: старое => новое", chat_id)
     elif data == "kw:search":
         ADMIN_MODES[chat_id] = "search"
-        await answer_callback(callback, "Отправьте строку поиска")
-        await safe_send_text("Отправьте часть ключевого слова для поиска.", chat_id)
+        await safe_send_text("Отправьте часть ключа для поиска.", chat_id)
     elif data == "kw:list":
-        await answer_callback(callback)
         await send_keyword_list(chat_id)
     elif data == "kw:stats":
-        await answer_callback(callback)
         await send_stats(chat_id)
-    elif data == "kw:reload":
-        reload_keywords_from_file()
-        await answer_callback(callback)
-        await safe_send_text("Перезагрузил keywords.json.", chat_id)
     elif data == "ch:add":
         ADMIN_MODES[chat_id] = "channel_add"
-        await answer_callback(callback, "Отправьте канал")
         await safe_send_text(
-            "Отправьте канал одним сообщением.\n\n"
-            "Открытый: @username или https://t.me/username\n"
-            "Закрытый по приглашению: https://t.me/+invite_hash\n"
-            "Закрытый уже в подписках: -1001234567890\n\n"
-            "Метка добавляется через вертикальную черту:\n"
-            "@username | РИА",
+            "Отправьте канал:\n"
+            "@username | метка\n"
+            "https://t.me/+invite_hash | метка\n"
+            "-1001234567890 | метка",
             chat_id,
         )
     elif data == "ch:delete":
         ADMIN_MODES[chat_id] = "channel_delete"
-        await answer_callback(callback, "Отправьте канал для удаления")
-        await safe_send_text("Отправьте ссылку, @username или ID канала, который нужно удалить.", chat_id)
+        await safe_send_text("Отправьте ссылку, @username или ID канала для удаления.", chat_id)
+    elif data == "ch:check":
+        ADMIN_MODES[chat_id] = "channel_check"
+        await safe_send_text("Отправьте ссылку, @username или ID канала для проверки.", chat_id)
     elif data == "ch:label":
         ADMIN_MODES[chat_id] = "channel_label"
-        await answer_callback(callback, "Формат: канал => метка")
         await safe_send_text("Отправьте: ссылка_или_id => новая метка", chat_id)
     elif data == "ch:search":
         ADMIN_MODES[chat_id] = "channel_search"
-        await answer_callback(callback, "Отправьте строку поиска")
         await safe_send_text("Отправьте часть ссылки, ID или метки канала.", chat_id)
     elif data == "ch:list":
-        await answer_callback(callback)
         await send_channel_list(chat_id)
+    elif data == "errors:last":
+        await send_errors(chat_id)
     elif data == "all:reload":
-        reload_keywords_from_file()
-        await safe_send_text(await reload_channels_and_refresh(), chat_id)
-        await answer_callback(callback)
+        await safe_send_text(await reload_all_from_db(), chat_id)
+    await answer_callback(callback)
 
 
 async def bot_control_loop() -> None:
@@ -982,7 +1095,7 @@ async def bot_control_loop() -> None:
                     else:
                         await safe_send_text("Нет доступа к управлению ботом.", chat_id)
         except Exception as exc:
-            log.warning("bot_control_loop: %s", exc)
+            log.error("bot_control_loop: %s", exc)
             await asyncio.sleep(BOT_CONTROL_INTERVAL)
 
 
@@ -991,22 +1104,14 @@ async def build_filters() -> Tuple[Dict[str, dict], Set[int], Set[str], Set[str]
     ids = set()
     usernames = set()
     id_strings = set()
-
     for channel in CHANNELS:
         try:
-            if "id" in channel:
-                entity = await client.get_input_entity(channel["id"])
-                key = str(channel["id"])
-            else:
-                link = channel["link"]
-                if "joinchat" in link or "t.me/+" in link:
-                    entity = await resolve_link_once(link)
-                    key = link
-                else:
-                    username = link.rsplit("/", 1)[-1].lstrip("@")
-                    entity = await resolve_username_once(username)
-                    key = username
-                    usernames.add(username.lower())
+            entity = await get_channel_entity(channel)
+            key = str(channel.get("id") or channel.get("link"))
+            if channel.get("link") and "t.me/+" not in channel["link"]:
+                username = channel["link"].rsplit("/", 1)[-1].lstrip("@")
+                usernames.add(username.lower())
+                key = username
 
             entities[key] = {
                 "entity": entity,
@@ -1016,24 +1121,19 @@ async def build_filters() -> Tuple[Dict[str, dict], Set[int], Set[str], Set[str]
             peer_id = get_peer_id(entity)
             ids.add(peer_id)
             id_strings.add(str(peer_id))
-
-            if peer_id not in LAST_SEEN_ID:
-                try:
-                    async for message in client.iter_messages(entity, limit=1):
-                        LAST_SEEN_ID[peer_id] = message.id
-                        break
-                except Exception:
-                    LAST_SEEN_ID[peer_id] = 0
+            if not get_last_seen(peer_id):
+                async for item in client.iter_messages(entity, limit=1):
+                    set_last_seen(peer_id, item.id)
+                    break
         except Exception as exc:
             log.error("Не удалось получить канал %s: %s", channel, exc)
-
-    save_state()
     return entities, ids, usernames, id_strings
 
 
 async def main() -> None:
-    rebuild_keyword_index()
-    load_state()
+    init_db()
+    migrate_json_to_db()
+    refresh_memory_from_db()
 
     try:
         await client.connect()
@@ -1049,26 +1149,11 @@ async def main() -> None:
         log.error("Ошибка авторизации: %s", exc)
         return
 
-    retry_queue = []
     for channel in CHANNELS:
-        ok = await join_channel(channel)
-        if not ok:
-            retry_queue.append((channel, 1))
+        await join_channel(channel)
         await asyncio.sleep(0.2)
 
-    for channel, attempt in retry_queue:
-        while attempt <= 3:
-            ok = await join_channel(channel)
-            if ok:
-                break
-            attempt += 1
-            await asyncio.sleep(30)
-        if attempt > 3:
-            log.warning("Пропускаю канал после 3 попыток: %s", channel)
-
-    global CHANNEL_ENTITIES, ALLOWED_IDS, ALLOWED_USERNAMES, ALLOWED_ID_STRINGS
-    CHANNEL_ENTITIES, ALLOWED_IDS, ALLOWED_USERNAMES, ALLOWED_ID_STRINGS = await build_filters()
-
+    await refresh_channel_filters()
     log.info("Слушаем каналы: %s", ", ".join(CHANNEL_ENTITIES.keys()))
 
     try:
@@ -1096,12 +1181,9 @@ async def main() -> None:
             log.debug("skip chat_id=%s username=%s", chat_id, username)
             return
 
-        if not event.message or not event.message.text:
-            return
+        await process_and_maybe_forward(chat, event.message, await event.get_input_chat())
 
-        await process_and_maybe_forward(chat, event.message)
-
-    log.info("Бот запущен. Управление ключами доступно через /menu у админов.")
+    log.info("Бот запущен. Управление доступно через /menu.")
     try:
         await client.run_until_disconnected()
     except Exception as exc:
