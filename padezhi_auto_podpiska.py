@@ -23,6 +23,7 @@ from telegram import (
     InputMediaVideo,
     error,
 )
+from telegram.request import HTTPXRequest
 from telethon import TelegramClient, events
 from telethon.errors.rpcerrorlist import (
     FloodWaitError,
@@ -57,6 +58,11 @@ POLL_LIMIT_PER_CHANNEL = 5
 PROCESSED_MAX_ITEMS = 5000
 BOT_CONTROL_INTERVAL = 1.2
 ALBUM_WAIT_SECONDS = 1.5
+BOT_CONNECT_TIMEOUT = 30
+BOT_POOL_TIMEOUT = 60
+BOT_MEDIA_TIMEOUT = 300
+BOT_CONNECTION_POOL_SIZE = 32
+MEDIA_CAPTION_LIMIT = 1000
 
 word_re = re.compile(r"\w+", flags=re.UNICODE)
 
@@ -114,7 +120,14 @@ def load_config() -> AppConfig:
 CONFIG = load_config()
 morph = pymorphy2.MorphAnalyzer(path=str(DATA_DIR))
 client = TelegramClient(str(BASE_DIR / "session_name"), CONFIG.api_id, CONFIG.api_hash)
-bot = Bot(token=CONFIG.bot_token)
+bot_request = HTTPXRequest(
+    connection_pool_size=BOT_CONNECTION_POOL_SIZE,
+    connect_timeout=BOT_CONNECT_TIMEOUT,
+    read_timeout=BOT_MEDIA_TIMEOUT,
+    write_timeout=BOT_MEDIA_TIMEOUT,
+    pool_timeout=BOT_POOL_TIMEOUT,
+)
+bot = Bot(token=CONFIG.bot_token, request=bot_request)
 
 RESOLVE_CACHE: Dict[str, Any] = {}
 PROCESSED = deque(maxlen=PROCESSED_MAX_ITEMS)
@@ -127,6 +140,7 @@ ALLOWED_ID_STRINGS: Set[str] = set()
 ADMIN_MODES: Dict[int, str] = {}
 ADMIN_SCREEN_MESSAGES: Dict[int, int] = {}
 BOT_UPDATE_OFFSET = 0
+BOT_SEND_LOCK = asyncio.Lock()
 
 KEYWORDS: List[str] = []
 CHANNELS: List[dict] = []
@@ -576,13 +590,18 @@ async def safe_send_text(text: str, chat_id: Optional[int] = None, reply_markup=
     for attempt in range(3):
         try:
             await asyncio.sleep(SEND_DELAY)
-            return await bot.send_message(
-                chat_id=target,
-                text=text[:4096],
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=reply_markup,
-            )
+            async with BOT_SEND_LOCK:
+                return await bot.send_message(
+                    chat_id=target,
+                    text=text[:4096],
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup,
+                    connect_timeout=BOT_CONNECT_TIMEOUT,
+                    read_timeout=BOT_MEDIA_TIMEOUT,
+                    write_timeout=BOT_MEDIA_TIMEOUT,
+                    pool_timeout=BOT_POOL_TIMEOUT,
+                )
         except (error.TimedOut, asyncio.TimeoutError):
             await asyncio.sleep(2**attempt)
         except Exception as exc:
@@ -602,6 +621,28 @@ def media_kind_for(message: Any) -> Optional[str]:
     return "document"
 
 
+def compact_media_caption(text: str, fallback_title: str) -> str:
+    if len(text) <= MEDIA_CAPTION_LIMIT:
+        return text
+
+    plain = re.sub(r"<[^>]+>", "", text)
+    plain = html.unescape(plain)
+    prefix = f"{fallback_title}\nПодпись сокращена из-за лимита Telegram.\n\n"
+    available = MEDIA_CAPTION_LIMIT - len(prefix) - 3
+    if available < 100:
+        return html.escape(fallback_title[:MEDIA_CAPTION_LIMIT])
+    return html.escape(prefix + plain[:available].rstrip() + "...")
+
+
+def media_timeout_kwargs() -> dict:
+    return {
+        "connect_timeout": BOT_CONNECT_TIMEOUT,
+        "read_timeout": BOT_MEDIA_TIMEOUT,
+        "write_timeout": BOT_MEDIA_TIMEOUT,
+        "pool_timeout": BOT_POOL_TIMEOUT,
+    }
+
+
 async def safe_send_media(text: str, media_path: Path, media_kind: str) -> None:
     caption = text if len(text) <= 1000 else "Найден пост с медиа. Текст отправлен отдельным сообщением."
     try:
@@ -617,6 +658,47 @@ async def safe_send_media(text: str, media_path: Path, media_kind: str) -> None:
     except Exception as exc:
         log.error("Ошибка отправки медиа: %s", exc)
         await safe_send_text(text)
+
+
+async def safe_send_media(text: str, media_path: Path, media_kind: str) -> None:
+    caption = compact_media_caption(text, "Найден пост с медиа.")
+    for attempt in range(3):
+        try:
+            with media_path.open("rb") as media:
+                async with BOT_SEND_LOCK:
+                    if media_kind == "photo":
+                        await bot.send_photo(
+                            CONFIG.channel_chat_id,
+                            media,
+                            caption=caption,
+                            parse_mode="HTML",
+                            **media_timeout_kwargs(),
+                        )
+                    elif media_kind == "video":
+                        await bot.send_video(
+                            CONFIG.channel_chat_id,
+                            media,
+                            caption=caption,
+                            parse_mode="HTML",
+                            supports_streaming=True,
+                            **media_timeout_kwargs(),
+                        )
+                    else:
+                        await bot.send_document(
+                            CONFIG.channel_chat_id,
+                            media,
+                            caption=caption,
+                            parse_mode="HTML",
+                            **media_timeout_kwargs(),
+                        )
+            return
+        except (error.TimedOut, asyncio.TimeoutError, error.NetworkError) as exc:
+            log.warning("Повтор отправки медиа %s/3 после таймаута: %s", attempt + 1, exc)
+            await asyncio.sleep(2 ** attempt)
+        except Exception as exc:
+            log.error("Ошибка отправки медиа: %s", exc)
+            break
+    await safe_send_text(text)
 
 
 async def send_album_to_target(text: str, messages: List[Any]) -> None:
@@ -662,6 +744,59 @@ async def send_album_to_target(text: str, messages: List[Any]) -> None:
             finally:
                 for handle in handles:
                     handle.close()
+    except Exception as exc:
+        log.error("Ошибка отправки альбома: %s", exc)
+        await safe_send_text(text)
+
+
+async def send_album_to_target(text: str, messages: List[Any]) -> None:
+    media_messages = [message for message in messages if media_kind_for(message)]
+    if not media_messages:
+        await safe_send_text(text)
+        return
+
+    caption = compact_media_caption(text, "Найден альбом.")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = []
+            for message in media_messages[:10]:
+                downloaded = await client.download_media(message, file=temp_dir)
+                if downloaded:
+                    paths.append((Path(downloaded), media_kind_for(message)))
+
+            if not paths:
+                await safe_send_text(text)
+                return
+
+            if len(paths) == 1:
+                await safe_send_media(text, paths[0][0], paths[0][1] or "document")
+                return
+
+            for attempt in range(3):
+                handles = []
+                media_group = []
+                try:
+                    for index, (path, kind) in enumerate(paths):
+                        handle = path.open("rb")
+                        handles.append(handle)
+                        media_caption = caption if index == 0 else None
+                        if kind == "photo":
+                            media_group.append(InputMediaPhoto(handle, caption=media_caption, parse_mode="HTML"))
+                        elif kind == "video":
+                            media_group.append(InputMediaVideo(handle, caption=media_caption, parse_mode="HTML"))
+                        else:
+                            media_group.append(InputMediaDocument(handle, caption=media_caption, parse_mode="HTML"))
+
+                    async with BOT_SEND_LOCK:
+                        await bot.send_media_group(CONFIG.channel_chat_id, media_group, **media_timeout_kwargs())
+                    return
+                except (error.TimedOut, asyncio.TimeoutError, error.NetworkError) as exc:
+                    log.warning("Повтор отправки альбома %s/3 после таймаута: %s", attempt + 1, exc)
+                    await asyncio.sleep(2 ** attempt)
+                finally:
+                    for handle in handles:
+                        handle.close()
+            await safe_send_text(text)
     except Exception as exc:
         log.error("Ошибка отправки альбома: %s", exc)
         await safe_send_text(text)
